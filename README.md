@@ -180,16 +180,45 @@ epa_echo_server/
 
 ## Deployment
 
-### Deploy to Render
+### Option 1: Deploy to Railway (Recommended - No Payment Info Required)
 
 1. **Push your code to GitHub** (if not already):
    ```bash
-   git init
    git add .
-   git commit -m "Initial commit"
-   git remote add origin <your-github-repo-url>
-   git push -u origin main
+   git commit -m "Ready for deployment"
+   git push
    ```
+
+2. **Go to [Railway.app](https://railway.app)** and sign up/login with GitHub
+
+3. **Create New Project**:
+   - Click "New Project"
+   - Select "Deploy from GitHub repo"
+   - Choose your repository
+
+4. **Add Environment Variable**:
+   - Click on your project → Variables
+   - Add: `MONGODB_DUMP_URI` = `mongodb+srv://username:password@cluster.mongodb.net/epaDump`
+
+5. **Deploy**:
+   - Railway auto-detects Node.js and deploys automatically
+   - Your API will be live at: `https://your-app-name.up.railway.app`
+
+6. **Test**:
+   ```bash
+   curl https://your-app-name.up.railway.app/health
+   curl https://your-app-name.up.railway.app/api/facilities?limit=10
+   ```
+
+**Railway Benefits:**
+- ✅ No payment info required for free tier
+- ✅ $5 free credit monthly
+- ✅ Auto-detects Node.js
+- ✅ Automatic HTTPS
+
+### Option 2: Deploy to Render (Requires Payment Info for Verification)
+
+1. **Push your code to GitHub**
 
 2. **Go to [Render Dashboard](https://dashboard.render.com)** and sign up/login
 
@@ -198,36 +227,19 @@ epa_echo_server/
    - Connect your GitHub repository
    - Select your repository
 
-4. **Configure the service**:
-   - **Name**: `epa-facilities-api` (or any name you prefer)
+4. **Configure**:
+   - **Name**: `epa-facilities-api`
    - **Environment**: `Node`
    - **Build Command**: `npm install`
    - **Start Command**: `npm start`
-   - **Plan**: Free (or choose a paid plan)
+   - **Plan**: Select **"Free"**
+   - **Note**: Render requires payment info for verification (you won't be charged on free plan)
 
-5. **Add Environment Variables**:
+5. **Add Environment Variable**:
    - Click "Environment" tab
-   - Add: `MONGODB_DUMP_URI` = `mongodb+srv://username:password@cluster.mongodb.net/epaDump`
-   - Add (optional): `NODE_ENV` = `production`
-   - Add (optional): `ALLOWED_ORIGINS` = `https://yourdomain.com` (comma-separated for multiple)
+   - Add: `MONGODB_DUMP_URI` = your connection string
 
-6. **Deploy**:
-   - Click "Create Web Service"
-   - Render will automatically build and deploy your app
-   - Your API will be available at: `https://epa-facilities-api.onrender.com` (or your custom domain)
-
-7. **Test your deployment**:
-   ```bash
-   curl https://your-app-name.onrender.com/health
-   curl https://your-app-name.onrender.com/api/facilities?limit=10
-   ```
-
-### Render Features:
-- ✅ Free tier available
-- ✅ Automatic HTTPS
-- ✅ Auto-deploy on git push
-- ✅ Health checks
-- ✅ Custom domains support
+6. **Deploy** and test your API
 
 ## License
 
