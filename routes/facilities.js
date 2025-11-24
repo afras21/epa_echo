@@ -3,6 +3,21 @@ const router = express.Router();
 const facilityController = require('../controllers/facilityController');
 
 /**
+ * POST /api/facilities
+ * Insert facilities into database
+ * - Removes null values before inserting (e.g., RCRA_PERMIT_TYPES: null will be removed)
+ * - Stops on storage error
+ * 
+ * Body: {
+ *   "facilities": [
+ *     { "FRS_ID": "...", "FacilityName": "...", ... },
+ *     ...
+ *   ]
+ * }
+ */
+router.post('/', (req, res) => facilityController.insertFacilities(req, res));
+
+/**
  * GET /api/facilities
  * Get all facilities with filtering and pagination
  * 

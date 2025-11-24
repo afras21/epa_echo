@@ -5,7 +5,8 @@ let dumpConnection = null;
 
 const FacilitySchema = new mongoose.Schema({
   // Facility identification
-  FRS_ID: String,
+  REGISTRY_ID: String, // Primary facility identifier (Registry ID)
+  FRS_ID: String, // Alternative/legacy field
   FacilityName: String,
   City: String,
   State: String,
@@ -50,7 +51,8 @@ const FacilitySchema = new mongoose.Schema({
 });
 
 // Indexes for efficient queries
-FacilitySchema.index({ FRS_ID: 1 });
+FacilitySchema.index({ REGISTRY_ID: 1 }); // Primary index for facility lookup
+FacilitySchema.index({ FRS_ID: 1 }); // Alternative index
 FacilitySchema.index({ State: 1 });
 FacilitySchema.index({ City: 1 });
 FacilitySchema.index({ Zip: 1 });
