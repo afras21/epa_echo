@@ -1,5 +1,202 @@
 const connectDumpDB = require('../config/dumpDatabase');
+const axios = require('axios');
 let dumpConnection = null;
+
+// EPA ECHO base URL
+const EPA_ECHO_BASE_URL = 'https://echodata.epa.gov';
+
+/**
+ * Transform raw facility data into structured format
+ */
+function transformRawData(raw) {
+  if (!raw) return null;
+
+  // Helper: Convert empty strings/null to null
+  const clean = (v) => (v === "" || v === undefined ? null : v);
+
+  // Helper: Convert EPA date formats to YYYY-MM-DD
+  const toDate = (d) => {
+    if (!d || d === "") return null;
+    // raw sometimes returns MM/DD/YYYY
+    if (typeof d === 'string' && d.includes("/")) {
+      const [m, day, y] = d.split("/");
+      return `${y}-${m.padStart(2, "0")}-${day.padStart(2, "0")}`;
+    }
+    return d;
+  };
+
+  // Programs detected from flags
+  const programs = [];
+  if (raw.NPDES_FLAG === "Y") programs.push({ code: "NPDES", programDesc: "National Pollutant Discharge Elimination System" });
+  if (raw.AIR_FLAG === "Y")   programs.push({ code: "CAA", programDesc: "Clean Air Act" });
+  if (raw.RCRA_FLAG === "Y")  programs.push({ code: "RCRA", programDesc: "Resource Conservation & Recovery Act" });
+  if (raw.TRI_FLAG === "Y")   programs.push({ code: "TRI", programDesc: "Toxic Release Inventory" });
+
+  // --- Compliance Score Calculation (0–10) ---
+  const scoreFromNC = (quarters) => {
+    if (quarters == null) return 10;
+    if (quarters === 0) return 10;
+    if (quarters === 1) return 8;
+    if (quarters === 2) return 6;
+    if (quarters === 3) return 4;
+    return 2;
+  };
+
+  const waterScore = scoreFromNC(Number(raw.CWA_QTRS_WITH_NC || 0));
+  const airScore = raw.AIR_FLAG === "Y" ? scoreFromNC(Number(raw.CAA_QTRS_WITH_NC || 0)) : 10;
+  const wasteScore = raw.RCRA_FLAG === "Y" ? scoreFromNC(Number(raw.RCRA_QTRS_WITH_NC || 0)) : 10;
+  const overallScore = Math.round((waterScore + airScore + wasteScore) / 3);
+
+  // Calculate days since last inspection
+  const lastInspectionDate = toDate(raw.FAC_DATE_LAST_INSPECTION_EPA) || toDate(raw.FAC_DATE_LAST_INSPECTION_STATE);
+  let daysSinceLastInspection = null;
+  if (lastInspectionDate) {
+    const inspectionDate = new Date(lastInspectionDate);
+    const today = new Date();
+    daysSinceLastInspection = Math.floor((today - inspectionDate) / (1000 * 60 * 60 * 24));
+  }
+
+  // Calculate days since last formal action
+  const lastFormalActionDate = toDate(raw.FAC_DATE_LAST_FORMAL_ACT_EPA);
+  let daysSinceLastFormalAction = null;
+  if (lastFormalActionDate) {
+    const actionDate = new Date(lastFormalActionDate);
+    const today = new Date();
+    daysSinceLastFormalAction = Math.floor((today - actionDate) / (1000 * 60 * 60 * 24));
+  }
+
+  // Count programs with SNC
+  let programsWithSNC = 0;
+  if (raw.CWA_SNC_FLG === "Y") programsWithSNC++;
+  if (raw.CAA_SNC_FLG === "Y") programsWithSNC++;
+  if (raw.RCRA_SNC_FLG === "Y") programsWithSNC++;
+
+  // Build permits array
+  const permits = [];
+  if (raw.NPDES_IDS) {
+    permits.push({
+      type: "NPDES Permit",
+      number: String(raw.NPDES_IDS),
+      issueDate: null,
+      expiryDate: null,
+      expirationDate: null,
+      status: raw.CWA_COMPLIANCE_STATUS || "Unknown",
+      program: "CWA",
+      programDesc: "National Pollutant Discharge Elimination System",
+      components: raw.CWA_PERMIT_TYPES ? [{ componentType: String(raw.CWA_PERMIT_TYPES), description: String(raw.CWA_PERMIT_TYPES) }] : [],
+      featureCoordinates: (raw.FAC_LAT && raw.FAC_LONG) ? [{
+        latitude: Number(raw.FAC_LAT),
+        longitude: Number(raw.FAC_LONG),
+        featureNumber: "001"
+      }] : []
+    });
+  }
+  if (raw.AIR_IDS) {
+    permits.push({
+      type: "Air Permit",
+      number: String(raw.AIR_IDS),
+      issueDate: null,
+      expiryDate: null,
+      expirationDate: null,
+      status: "Active",
+      program: "CAA",
+      programDesc: "Clean Air Act"
+    });
+  }
+  if (raw.RCRA_IDS) {
+    permits.push({
+      type: "RCRA Permit",
+      number: String(raw.RCRA_IDS),
+      issueDate: null,
+      expiryDate: null,
+      expirationDate: null,
+      status: "Active",
+      program: "RCRA",
+      programDesc: "Resource Conservation & Recovery Act"
+    });
+  }
+
+  // --- Build the Output Object ---
+  return {
+    _id: raw.REGISTRY_ID,
+    REGISTRY_ID: raw.REGISTRY_ID,
+    facility: {
+      id: raw.REGISTRY_ID,
+      registryId: raw.REGISTRY_ID,
+      epaId: raw.REGISTRY_ID,
+      name: clean(raw.FAC_NAME),
+      facilityName: clean(raw.FAC_NAME),
+      address: clean(raw.FAC_STREET),
+      street: clean(raw.FAC_STREET),
+      city: clean(raw.FAC_CITY),
+      state: clean(raw.FAC_STATE),
+      zip: clean(raw.FAC_ZIP),
+      county: clean(raw.FAC_COUNTY),
+      latitude: Number(raw.FAC_LAT) || 0,
+      longitude: Number(raw.FAC_LONG) || 0,
+      industry: clean(raw.SIC_DESCRIPTION) || "",
+      sicCode: clean(raw.FAC_SIC_CODES),
+      naicsCode: clean(raw.FAC_NAICS_CODES),
+      established: "",
+      employees: "",
+      phone: "",
+      email: "",
+      riskScore: 0,
+      programs,
+      complianceStatus: clean(raw.FAC_COMPLIANCE_STATUS) || "Unknown",
+      lastInspection: lastInspectionDate,
+      lastInspectionType: raw.FAC_DATE_LAST_INSPECTION_EPA ? "EPA" :
+                          raw.FAC_DATE_LAST_INSPECTION_STATE ? "State" :
+                          "Unknown",
+      inspectionDates: {
+        epa: toDate(raw.FAC_DATE_LAST_INSPECTION_EPA),
+        state: toDate(raw.FAC_DATE_LAST_INSPECTION_STATE),
+        mostRecent: {
+          date: lastInspectionDate,
+          type: raw.FAC_DATE_LAST_INSPECTION_EPA ? "EPA" :
+                raw.FAC_DATE_LAST_INSPECTION_STATE ? "State" :
+                "Unknown"
+        }
+      },
+      enforcementActions: {
+        lastFormalActionEPA: toDate(raw.FAC_DATE_LAST_FORMAL_ACT_EPA),
+        lastFormalActionState: toDate(raw.FAC_DATE_LAST_FORMAL_ACT_STATE),
+        lastInformalActionEPA: toDate(raw.FAC_DATE_LAST_INFORMAL_ACT_EPA),
+        lastInformalActionState: toDate(raw.FAC_DATE_LAST_INFORMAL_ACT_STATE)
+      },
+      permits,
+      aggregatedData: {
+        totalPenalties: Number(raw.FAC_TOTAL_PENALTIES || 0),
+        formalActionCount: Number(raw.FAC_FORMAL_ACTION_COUNT || 0),
+        informalCount: Number(raw.FAC_INFORMAL_COUNT || 0),
+        inspectionCount: Number(raw.FAC_INSPECTION_COUNT || 0),
+        quartersWithNC: Number(raw.FAC_QTRS_WITH_NC || 0),
+        programsWithSNC: programsWithSNC,
+        daysSinceLastInspection: daysSinceLastInspection,
+        daysSinceLastFormalAction: daysSinceLastFormalAction
+      },
+      iconBaseURL: "https://echo.epa.gov/themes/custom/echo/images/map/",
+      mapIcon: raw.FAC_MAP_ICON || raw.mapIcon || "",
+      mapIconURL: raw.mapIconURL || (raw.FAC_MAP_ICON ? `https://echo.epa.gov/themes/custom/echo/images/map/${raw.FAC_MAP_ICON}` : "")
+    },
+    violations: [], // Will fill separately from CWA/CAA/RCRA endpoints
+    inspections: [],
+    complianceScores: {
+      overall: overallScore,
+      air: airScore,
+      water: waterScore,
+      waste: wasteScore
+    },
+    enforcementActions: [],
+    emissions: [],
+    stackTests: [],
+    titleVCerts: [],
+    pollutants: [],
+    dataGroups: [],
+    qncrHistory: [],
+    rawData: raw
+  };
+}
 
 class FacilityController {
   /**
@@ -18,6 +215,14 @@ class FacilityController {
   async getFacilityModel() {
     const conn = await this.getDumpConnection();
     return conn.Facility;
+  }
+
+  /**
+   * Get FacilityDetails model from connection
+   */
+  async getFacilityDetailsModel() {
+    const conn = await this.getDumpConnection();
+    return conn.FacilityDetails;
   }
 
   /**
@@ -359,6 +564,2043 @@ class FacilityController {
         error: error.message,
       });
     }
+  }
+
+  /**
+   * Get facility statistics and analytics
+   * Returns: total count, high-risk count, active violations, non-compliant count, top 3 high-risk facilities
+   */
+  async getFacilityStatistics(req, res) {
+    try {
+      // Get Facility model
+      let Facility;
+      try {
+        Facility = await this.getFacilityModel();
+      } catch (error) {
+        return res.status(500).json({
+          success: false,
+          error: `Failed to connect to dump database: ${error.message}`,
+        });
+      }
+
+      if (!Facility) {
+        return res.status(500).json({
+          success: false,
+          error: 'Facility model not available',
+        });
+      }
+
+      // Total facilities count
+      const totalCount = await Facility.countDocuments({});
+
+      // High-risk facilities: facilities with violations, non-compliance, or enforcement actions
+      // Check for common violation/compliance indicators in facilityData
+      const highRiskQuery = {
+        $or: [
+          // Check for violation indicators in facilityData
+          { 'facilityData.Violations': { $exists: true, $ne: null } },
+          { 'facilityData.violations': { $exists: true, $ne: null } },
+          { 'facilityData.Violation': { $exists: true, $ne: null } },
+          { 'facilityData.violation': { $exists: true, $ne: null } },
+          { 'facilityData.ViolationCount': { $gt: 0 } },
+          { 'facilityData.violationCount': { $gt: 0 } },
+          { 'facilityData.Violation_Count': { $gt: 0 } },
+          
+          // Check for non-compliance indicators
+          { 'facilityData.ComplianceStatus': { $regex: /non.?compliant|violation|serious/i } },
+          { 'facilityData.complianceStatus': { $regex: /non.?compliant|violation|serious/i } },
+          { 'facilityData.Compliance_Status': { $regex: /non.?compliant|violation|serious/i } },
+          { 'facilityData.Status': { $regex: /non.?compliant|violation|serious/i } },
+          
+          // Check for enforcement actions
+          { 'source.folder': { $regex: /enforcement/i } },
+          { 'facilityData.EnforcementAction': { $exists: true, $ne: null } },
+          { 'facilityData.enforcementAction': { $exists: true, $ne: null } },
+          
+          // Check for significant violations
+          { 'facilityData.SignificantViolation': { $in: ['Y', 'Yes', true] } },
+          { 'facilityData.significantViolation': { $in: ['Y', 'Yes', true] } },
+          { 'facilityData.Significant_Violation': { $in: ['Y', 'Yes', true] } },
+        ]
+      };
+
+      const highRiskCount = await Facility.countDocuments(highRiskQuery);
+
+      // Active violations count
+      // Count facilities with active/open violations
+      const activeViolationsQuery = {
+        $or: [
+          { 'facilityData.ViolationStatus': { $regex: /active|open|current/i } },
+          { 'facilityData.violationStatus': { $regex: /active|open|current/i } },
+          { 'facilityData.Violation_Status': { $regex: /active|open|current/i } },
+          { 'facilityData.ActiveViolations': { $gt: 0 } },
+          { 'facilityData.activeViolations': { $gt: 0 } },
+          { 'facilityData.Active_Violations': { $gt: 0 } },
+        ]
+      };
+      const activeViolationsCount = await Facility.countDocuments(activeViolationsQuery);
+
+      // Non-compliant count
+      const nonCompliantQuery = {
+        $or: [
+          { 'facilityData.ComplianceStatus': { $regex: /non.?compliant|non.?compliance/i } },
+          { 'facilityData.complianceStatus': { $regex: /non.?compliant|non.?compliance/i } },
+          { 'facilityData.Compliance_Status': { $regex: /non.?compliant|non.?compliance/i } },
+          { 'facilityData.Status': { $regex: /non.?compliant|non.?compliance/i } },
+        ]
+      };
+      const nonCompliantCount = await Facility.countDocuments(nonCompliantQuery);
+
+      // Top 3 high-risk facilities
+      // Get facilities sorted by violation count or risk indicators
+      const topHighRiskFacilities = await Facility.find(highRiskQuery)
+        .sort({
+          // Sort by violation count if available, otherwise by creation date (newest first)
+          'facilityData.ViolationCount': -1,
+          'facilityData.violationCount': -1,
+          'facilityData.Violation_Count': -1,
+          createdAt: -1,
+        })
+        .limit(3)
+        .lean()
+        .select('REGISTRY_ID registry_id FRS_ID FacilityName facilityName City State Zip facilityData source');
+
+      // Format top facilities
+      const formattedTopFacilities = topHighRiskFacilities.map(facility => ({
+        registryId: facility.REGISTRY_ID || facility.registry_id || facility.FRS_ID,
+        facilityName: facility.FacilityName || facility.facilityName || 'Unknown',
+        city: facility.City || facility.city,
+        state: facility.State || facility.state,
+        zip: facility.Zip || facility.zip,
+        violationCount: facility.facilityData?.ViolationCount || 
+                       facility.facilityData?.violationCount || 
+                       facility.facilityData?.Violation_Count || 
+                       0,
+        complianceStatus: facility.facilityData?.ComplianceStatus || 
+                         facility.facilityData?.complianceStatus || 
+                         facility.facilityData?.Compliance_Status || 
+                         'Unknown',
+        sourceType: facility.source?.type || 'unknown',
+      }));
+
+      res.json({
+        success: true,
+        data: {
+          totalFacilities: totalCount,
+          highRiskFacilities: highRiskCount,
+          activeViolations: activeViolationsCount,
+          nonCompliant: nonCompliantCount,
+          topHighRiskFacilities: formattedTopFacilities,
+          summary: {
+            compliantFacilities: totalCount - nonCompliantCount,
+            complianceRate: totalCount > 0 ? ((totalCount - nonCompliantCount) / totalCount * 100).toFixed(2) : 0,
+            riskPercentage: totalCount > 0 ? (highRiskCount / totalCount * 100).toFixed(2) : 0,
+          },
+        },
+      });
+    } catch (error) {
+      console.error(`[ERROR] Error in getFacilityStatistics:`, error);
+      res.status(500).json({
+        success: false,
+        error: error.message,
+      });
+    }
+  }
+
+  /**
+   * Helper function to get value from nested object with multiple key variations
+   */
+  getValue(obj, keys, defaultValue = null) {
+    for (const key of keys) {
+      if (obj && obj[key] !== undefined && obj[key] !== null) {
+        return obj[key];
+      }
+    }
+    return defaultValue;
+  }
+
+  /**
+   * Derive program participation from flags
+   */
+  derivePrograms(facilityData) {
+    const programs = [];
+    const programFlags = {
+      'AIR_FLAG': 'CAA',
+      'NPDES_FLAG': 'NPDES',
+      'SDWIS_FLAG': 'SDWIS',
+      'RCRA_FLAG': 'RCRA',
+      'TRI_FLAG': 'TRI',
+      'GHG_FLAG': 'GHG',
+    };
+
+    Object.entries(programFlags).forEach(([flag, program]) => {
+      const value = this.getValue(facilityData, [flag, flag.toLowerCase()]);
+      if (value === 'Y' || value === 'Yes' || value === true) {
+        programs.push(program);
+      }
+    });
+
+    return programs;
+  }
+
+  /**
+   * Parse compliance history string (e.g., "____________" or "VVSSRR____")
+   * _ = no violation, V = violation, S = SNC, R = resolved
+   */
+  parseComplianceHistory(historyString) {
+    if (!historyString || typeof historyString !== 'string') {
+      return null;
+    }
+
+    const quarters = [];
+    for (let i = 0; i < historyString.length; i++) {
+      const char = historyString[i];
+      const status = {
+        '_': 'no_violation',
+        'V': 'violation',
+        'S': 'snc',
+        'R': 'resolved',
+      }[char] || 'unknown';
+
+      quarters.push({
+        quarter: i + 1,
+        status: status,
+        symbol: char,
+      });
+    }
+
+    return {
+      history: quarters,
+      totalQuarters: quarters.length,
+      violations: quarters.filter(q => q.status === 'violation' || q.status === 'snc').length,
+      sncCount: quarters.filter(q => q.status === 'snc').length,
+      resolvedCount: quarters.filter(q => q.status === 'resolved').length,
+    };
+  }
+
+  /**
+   * Get EPA region name from number
+   */
+  getEPARegionName(regionNumber) {
+    const regions = {
+      1: 'New England',
+      2: 'Mid-Atlantic',
+      3: 'Mid-Atlantic',
+      4: 'Southeast',
+      5: 'Midwest',
+      6: 'South Central',
+      7: 'Great Plains',
+      8: 'Mountains & Plains',
+      9: 'Pacific Southwest',
+      10: 'Pacific Northwest',
+    };
+    return regions[regionNumber] || `Region ${regionNumber}`;
+  }
+
+  /**
+   * Generate map tile URL
+   */
+  generateMapUrl(lat, lng) {
+    if (!lat || !lng) return null;
+    return {
+      openstreetmap: `https://www.openstreetmap.org/?mlat=${lat}&mlon=${lng}&zoom=15`,
+      google: `https://www.google.com/maps?q=${lat},${lng}`,
+    };
+  }
+
+  /**
+   * Fetch data from EPA ECHO API with logging
+   */
+  async fetchEPAEndpoint(endpoint, params = {}) {
+    try {
+      const url = `${EPA_ECHO_BASE_URL}${endpoint}`;
+      console.log(`[EPA API] Fetching: ${url}`);
+      console.log(`[EPA API] Params:`, JSON.stringify(params));
+
+      // Add p_id parameter if registry_id is provided to get specific facility
+      const requestParams = {
+        output: 'JSON',
+        ...params,
+      };
+      
+      // If registry_id is provided, also add p_id to get specific facility (not clusters)
+      if (params.registry_id && !params.p_id) {
+        requestParams.p_id = params.registry_id;
+      }
+      
+      const response = await axios.get(url, {
+        params: requestParams,
+        timeout: 15000, // 15 second timeout
+      });
+
+      console.log(`[EPA API] Success: ${url} - Status: ${response.status}`);
+      
+      // Log response structure for debugging
+      if (response.data) {
+        const dataKeys = Object.keys(response.data);
+        console.log(`[EPA API] Response keys:`, dataKeys);
+        
+        // Check if Results exists and what structure it has
+        if (response.data.Results) {
+          const results = response.data.Results;
+          
+          // Check if it's cluster data or facility data
+          if (results.ClusterOutput) {
+            console.log(`[EPA API] WARNING: Received cluster data instead of facility data. Query may have too many results.`);
+            console.log(`[EPA API] QueryRows: ${results.QueryRows || 'N/A'}`);
+          }
+          
+          // Check for Facilities array
+          if (results.Facilities) {
+            const facilitiesCount = Array.isArray(results.Facilities) 
+              ? results.Facilities.length 
+              : (results.Facilities ? 1 : 0);
+            console.log(`[EPA API] Facilities count: ${facilitiesCount}`);
+          }
+          
+          // Check if Results is an array (some endpoints return arrays)
+          if (Array.isArray(results)) {
+            console.log(`[EPA API] Results is an array with ${results.length} items`);
+          }
+        }
+        
+        // Log a sample of the data structure
+        if (dataKeys.length > 0) {
+          console.log(`[EPA API] Sample data structure:`, JSON.stringify(response.data).substring(0, 500));
+        }
+      }
+      
+      return response.data;
+    } catch (error) {
+      console.error(`[EPA API] Error fetching ${endpoint}:`, error.message);
+      if (error.response) {
+        console.error(`[EPA API] Response status: ${error.response.status}`);
+        console.error(`[EPA API] Response headers:`, error.response.headers);
+        console.error(`[EPA API] Response data:`, JSON.stringify(error.response.data).substring(0, 500));
+      } else if (error.request) {
+        console.error(`[EPA API] No response received. Request:`, error.request);
+      } else {
+        console.error(`[EPA API] Error setting up request:`, error.message);
+      }
+      return null;
+    }
+  }
+
+  /**
+   * Fetch violation history from EPA
+   */
+  async fetchViolationHistory(registryId) {
+    console.log(`[EPA API] Fetching violation history for REGISTRY_ID: ${registryId}`);
+    return await this.fetchEPAEndpoint('/echo/echo_rest_services.get_violation_history', {
+      registry_id: registryId,
+    });
+  }
+
+  /**
+   * Fetch inspection data from EPA
+   */
+  async fetchInspections(registryId) {
+    console.log(`[EPA API] Fetching inspections for REGISTRY_ID: ${registryId}`);
+    return await this.fetchEPAEndpoint('/echo/echo_rest_services.get_inspection', {
+      registry_id: registryId,
+    });
+  }
+
+  /**
+   * Fetch enforcement actions from EPA
+   */
+  async fetchEnforcement(registryId) {
+    console.log(`[EPA API] Fetching enforcement actions for REGISTRY_ID: ${registryId}`);
+    return await this.fetchEPAEndpoint('/echo/echo_rest_services.get_enforcement', {
+      registry_id: registryId,
+    });
+  }
+
+  /**
+   * Fetch NPDES permit details
+   */
+  async fetchNPDESPermitInfo(npdesId) {
+    if (!npdesId) return null;
+    console.log(`[EPA API] Fetching NPDES permit info for: ${npdesId}`);
+    return await this.fetchEPAEndpoint('/echo/cwa_rest_services.get_facility_info', {
+      npdes_id: npdesId,
+    });
+  }
+
+  /**
+   * Fetch effluent chart data
+   */
+  async fetchEffluentChart(npdesId) {
+    if (!npdesId) return null;
+    console.log(`[EPA API] Fetching effluent chart for NPDES: ${npdesId}`);
+    return await this.fetchEPAEndpoint('/echo/eff_rest_services.get_effluent_chart', {
+      npdes_id: npdesId,
+    });
+  }
+
+  /**
+   * Fetch all CWA (Water) data
+   */
+  async fetchCWAData(registryId, npdesId = null) {
+    console.log(`[EPA API] Fetching CWA data for REGISTRY_ID: ${registryId}, NPDES_ID: ${npdesId || 'N/A'}`);
+    
+    const promises = [
+      this.fetchEPAEndpoint('/echo/cwa_rest_services.get_facility_info', { registry_id: registryId }),
+      this.fetchEPAEndpoint('/echo/cwa_rest_services.get_violation_history', { registry_id: registryId }),
+      this.fetchEPAEndpoint('/echo/cwa_rest_services.get_inspection_history', { registry_id: registryId }),
+      this.fetchEPAEndpoint('/echo/cwa_rest_services.get_enforcement_history', { registry_id: registryId }),
+    ];
+    
+    if (npdesId) {
+      promises.push(this.fetchEffluentChart(npdesId));
+      promises.push(this.fetchEPAEndpoint('/echo/cwa_rest_services.get_permit', { npdes_id: npdesId }));
+    } else {
+      promises.push(Promise.resolve(null));
+      promises.push(Promise.resolve(null));
+    }
+    
+    const results = await Promise.allSettled(promises);
+    const [facilityInfo, violations, inspections, enforcement, effluentChart, permit] = results.map(r => 
+      r.status === 'fulfilled' ? r.value : null
+    );
+
+    // Log what we got
+    console.log(`[INFO] CWA fetch results for REGISTRY_ID: ${registryId}:`);
+    console.log(`  - Facility Info: ${facilityInfo ? '✓' : '✗'} ${facilityInfo ? `(${JSON.stringify(facilityInfo).substring(0, 100)})` : ''}`);
+    console.log(`  - Violations: ${violations ? '✓' : '✗'}`);
+    console.log(`  - Inspections: ${inspections ? '✓' : '✗'}`);
+    console.log(`  - Enforcement: ${enforcement ? '✓' : '✗'}`);
+    console.log(`  - Effluent Chart: ${effluentChart ? '✓' : '✗'}`);
+    console.log(`  - Permit: ${permit ? '✓' : '✗'}`);
+
+    return {
+      facilityInfo,
+      violations,
+      inspections,
+      enforcement,
+      effluentChart,
+      permit,
+    };
+  }
+
+  /**
+   * Fetch all CAA (Air) data with detailed information
+   */
+  async fetchCAAData(registryId) {
+    console.log(`[EPA API] Fetching comprehensive CAA data for REGISTRY_ID: ${registryId}`);
+    
+    // First get basic facility info to extract IDs for detailed queries
+    const facilityInfo = await this.fetchEPAEndpoint('/echo/ca_rest_services.get_facility_info', { registry_id: registryId });
+    
+    // Extract IDs from facility info for detailed queries
+    const airIds = this.extractAirIds(facilityInfo);
+    
+    const [
+      violations,
+      inspections,
+      enforcement,
+      permitClassifications,
+      hpvFlags,
+      emissionCategories,
+      emissionUnitDetails,
+      pollutantReleases,
+      permits,
+    ] = await Promise.allSettled([
+      this.fetchEPAEndpoint('/echo/ca_rest_services.get_violation_history', { registry_id: registryId }),
+      this.fetchEPAEndpoint('/echo/ca_rest_services.get_inspection_history', { registry_id: registryId }),
+      this.fetchEPAEndpoint('/echo/ca_rest_services.get_enforcement_history', { registry_id: registryId }),
+      // Additional detailed endpoints (if available)
+      airIds.airId ? this.fetchEPAEndpoint('/echo/ca_rest_services.get_facility_info', { 
+        registry_id: registryId,
+        detailed: 'Y' 
+      }) : null,
+      // HPV flags are usually in facility info
+      null, // Will extract from facilityInfo
+      // Emission categories and unit details
+      airIds.airId ? this.fetchEPAEndpoint('/echo/ca_rest_services.get_emissions', { 
+        registry_id: registryId 
+      }) : null,
+      airIds.airId ? this.fetchEPAEndpoint('/echo/ca_rest_services.get_emission_units', { 
+        registry_id: registryId 
+      }) : null,
+      airIds.airId ? this.fetchEPAEndpoint('/echo/ca_rest_services.get_pollutant_releases', { 
+        registry_id: registryId 
+      }) : null,
+      // Air permits with dates and agency
+      airIds.airId ? this.fetchEPAEndpoint('/echo/ca_rest_services.get_permits', { 
+        registry_id: registryId 
+      }) : null,
+    ]);
+
+    // Extract HPV flags and permit classifications from facility info
+    const hpvFlagsData = this.extractHPVFlags(facilityInfo);
+    const permitClassificationsData = this.extractPermitClassifications(facilityInfo);
+
+    return {
+      facilityInfo,
+      violations: violations.status === 'fulfilled' ? violations.value : null,
+      inspections: inspections.status === 'fulfilled' ? inspections.value : null,
+      enforcement: enforcement.status === 'fulfilled' ? enforcement.value : null,
+      permitClassifications: permitClassificationsData || (permitClassifications.status === 'fulfilled' ? permitClassifications.value : null),
+      hpvFlags: hpvFlagsData,
+      emissionCategories: emissionCategories.status === 'fulfilled' ? emissionCategories.value : null,
+      emissionUnitDetails: emissionUnitDetails.status === 'fulfilled' ? emissionUnitDetails.value : null,
+      pollutantReleases: pollutantReleases.status === 'fulfilled' ? pollutantReleases.value : null,
+      permits: permits.status === 'fulfilled' ? permits.value : null,
+    };
+  }
+
+  /**
+   * Extract Air IDs from facility info
+   */
+  extractAirIds(facilityInfo) {
+    if (!facilityInfo || !facilityInfo.Results) return {};
+    
+    const results = Array.isArray(facilityInfo.Results) ? facilityInfo.Results[0] : facilityInfo.Results;
+    return {
+      airId: results?.AIR_ID || results?.air_id,
+      permitId: results?.PERMIT_ID || results?.permit_id,
+    };
+  }
+
+  /**
+   * Extract HPV flags from facility info
+   */
+  extractHPVFlags(facilityInfo) {
+    if (!facilityInfo || !facilityInfo.Results) return null;
+    
+    const results = Array.isArray(facilityInfo.Results) ? facilityInfo.Results[0] : facilityInfo.Results;
+    return {
+      hpvFlag: results?.HPV_FLAG || results?.hpv_flag,
+      hpvStatus: results?.HPV_STATUS || results?.hpv_status,
+      majorSource: results?.MAJOR_SOURCE || results?.major_source,
+    };
+  }
+
+  /**
+   * Extract permit classifications from facility info
+   */
+  extractPermitClassifications(facilityInfo) {
+    if (!facilityInfo || !facilityInfo.Results) return null;
+    
+    const results = Array.isArray(facilityInfo.Results) ? facilityInfo.Results[0] : facilityInfo.Results;
+    return {
+      permitType: results?.PERMIT_TYPE || results?.permit_type,
+      permitClassification: results?.PERMIT_CLASSIFICATION || results?.permit_classification,
+      permitStatus: results?.PERMIT_STATUS || results?.permit_status,
+      permitAgency: results?.PERMIT_AGENCY || results?.permit_agency,
+      permitIssueDate: results?.PERMIT_ISSUE_DATE || results?.permit_issue_date,
+      permitExpireDate: results?.PERMIT_EXPIRE_DATE || results?.permit_expire_date,
+    };
+  }
+
+  /**
+   * Fetch all RCRA (Hazardous Waste) data with detailed information
+   */
+  async fetchRCRAData(registryId) {
+    console.log(`[EPA API] Fetching comprehensive RCRA data for REGISTRY_ID: ${registryId}`);
+    
+    const [
+      facilityInfo,
+      violations,
+      inspections,
+      enforcement,
+    ] = await Promise.all([
+      this.fetchEPAEndpoint('/echo/rcr_rest_services.get_facility_info', { registry_id: registryId }),
+      this.fetchEPAEndpoint('/echo/rcr_rest_services.get_violation_history', { registry_id: registryId }),
+      this.fetchEPAEndpoint('/echo/rcr_rest_services.get_inspection_history', { registry_id: registryId }),
+      this.fetchEPAEndpoint('/echo/rcr_rest_services.get_enforcement_history', { registry_id: registryId }),
+    ]);
+
+    // Extract detailed handler information, generator category, and waste codes from facility info
+    const handlerDetails = this.extractRCRADetails(facilityInfo);
+    const generatorCategory = this.extractGeneratorCategory(facilityInfo);
+    const wasteCodes = this.extractWasteCodes(facilityInfo);
+
+    return {
+      facilityInfo,
+      violations,
+      inspections,
+      enforcement,
+      handlerDetails,
+      generatorCategory,
+      wasteCodes,
+    };
+  }
+
+  /**
+   * Extract RCRA handler details
+   */
+  extractRCRADetails(facilityInfo) {
+    if (!facilityInfo || !facilityInfo.Results) return null;
+    
+    const results = Array.isArray(facilityInfo.Results) ? facilityInfo.Results[0] : facilityInfo.Results;
+    return {
+      handlerType: results?.HANDLER_TYPE || results?.handler_type,
+      handlerStatus: results?.HANDLER_STATUS || results?.handler_status,
+      handlerName: results?.HANDLER_NAME || results?.handler_name,
+      handlerAddress: results?.HANDLER_ADDRESS || results?.handler_address,
+      handlerCity: results?.HANDLER_CITY || results?.handler_city,
+      handlerState: results?.HANDLER_STATE || results?.handler_state,
+      handlerZip: results?.HANDLER_ZIP || results?.handler_zip,
+    };
+  }
+
+  /**
+   * Extract generator category
+   */
+  extractGeneratorCategory(facilityInfo) {
+    if (!facilityInfo || !facilityInfo.Results) return null;
+    
+    const results = Array.isArray(facilityInfo.Results) ? facilityInfo.Results[0] : facilityInfo.Results;
+    return {
+      generatorStatus: results?.GENERATOR_STATUS || results?.generator_status,
+      generatorType: results?.GENERATOR_TYPE || results?.generator_type,
+      generatorCategory: results?.GENERATOR_CATEGORY || results?.generator_category,
+      largeQuantityGenerator: results?.LQG || results?.lqg,
+      smallQuantityGenerator: results?.SQG || results?.sqg,
+      verySmallQuantityGenerator: results?.VSQG || results?.vsqg,
+    };
+  }
+
+  /**
+   * Extract waste codes
+   */
+  extractWasteCodes(facilityInfo) {
+    if (!facilityInfo || !facilityInfo.Results) return null;
+    
+    const results = Array.isArray(facilityInfo.Results) ? facilityInfo.Results[0] : facilityInfo.Results;
+    return {
+      wasteCodes: results?.WASTE_CODES || results?.waste_codes,
+      wasteCodeDescriptions: results?.WASTE_CODE_DESCRIPTIONS || results?.waste_code_descriptions,
+      hazardousWasteCodes: results?.HAZARDOUS_WASTE_CODES || results?.hazardous_waste_codes,
+    };
+  }
+
+  /**
+   * Fetch all SDWA (Drinking Water) data
+   */
+  async fetchSDWAData(registryId) {
+    console.log(`[EPA API] Fetching SDWA data for REGISTRY_ID: ${registryId}`);
+    const [facilityInfo, violations, enforcement] = await Promise.all([
+      this.fetchEPAEndpoint('/echo/dsd_rest_services.get_facility_info', { registry_id: registryId }),
+      this.fetchEPAEndpoint('/echo/dsd_rest_services.get_violation_history', { registry_id: registryId }),
+      this.fetchEPAEndpoint('/echo/dsd_rest_services.get_enforcement_history', { registry_id: registryId }),
+    ]);
+
+    return {
+      facilityInfo,
+      violations,
+      enforcement,
+    };
+  }
+
+  /**
+   * Fetch TRI data (requires TRIFID from facility info)
+   */
+  async fetchTRIData(triFacilityId) {
+    if (!triFacilityId) return null;
+    console.log(`[EPA API] Fetching TRI data for TRIFID: ${triFacilityId}`);
+    return await this.fetchEPAEndpoint('/echo/tri_rest_services.get_tri_facility', {
+      tri_facility_id: triFacilityId,
+    });
+  }
+
+  /**
+   * Fetch GHG data (requires GHG ID)
+   */
+  async fetchGHGData(ghgId) {
+    if (!ghgId) return null;
+    console.log(`[EPA API] Fetching GHG data for GHG ID: ${ghgId}`);
+    try {
+      const url = `https://api.epa.gov/easey/ghg-facilities-mgmt/facilities/${ghgId}`;
+      console.log(`[EPA API] Fetching: ${url}`);
+      const response = await axios.get(url, { timeout: 10000 });
+      console.log(`[EPA API] Success: ${url} - Status: ${response.status}`);
+      return response.data;
+    } catch (error) {
+      console.error(`[EPA API] Error fetching GHG data:`, error.message);
+      return null;
+    }
+  }
+
+  /**
+   * Fetch comprehensive EJScreen data using coordinates (100+ fields)
+   */
+  async fetchEJScreenData(lat, lng) {
+    if (!lat || !lng) return null;
+    console.log(`[EPA API] Fetching comprehensive EJScreen data for coordinates: ${lat}, ${lng}`);
+    
+    const ejscreenData = await this.fetchEPAEndpoint('/echo/ej_rest_services.get_ejscreen', {
+      latitude: lat,
+      longitude: lng,
+    });
+
+    if (!ejscreenData) return null;
+
+    // Extract and organize EJScreen data into categories
+    return {
+      // Air toxics
+      airToxics: this.extractEJScreenCategory(ejscreenData, ['airToxics', 'air_toxics', 'AIR_TOXICS']),
+      
+      // Water discharge EJ
+      waterDischargeEJ: this.extractEJScreenCategory(ejscreenData, ['waterDischargeEJ', 'water_discharge_ej', 'WATER_DISCHARGE_EJ']),
+      
+      // Climate risk
+      climateRisk: this.extractEJScreenCategory(ejscreenData, ['climateRisk', 'climate_risk', 'CLIMATE_RISK']),
+      
+      // Traffic proximity
+      trafficProximity: this.extractEJScreenCategory(ejscreenData, ['trafficProximity', 'traffic_proximity', 'TRAFFIC_PROXIMITY']),
+      
+      // Lead paint
+      leadPaint: this.extractEJScreenCategory(ejscreenData, ['leadPaint', 'lead_paint', 'LEAD_PAINT']),
+      
+      // Superfund proximity
+      superfundProximity: this.extractEJScreenCategory(ejscreenData, ['superfundProximity', 'superfund_proximity', 'SUPERFUND_PROXIMITY']),
+      
+      // All raw data (100+ fields)
+      rawData: ejscreenData,
+    };
+  }
+
+  /**
+   * Extract EJScreen category data
+   */
+  extractEJScreenCategory(ejscreenData, keys) {
+    for (const key of keys) {
+      if (ejscreenData[key]) {
+        return ejscreenData[key];
+      }
+    }
+    // If category not found, extract related fields
+    const categoryFields = {};
+    const keyPattern = keys[0].toLowerCase();
+    Object.keys(ejscreenData).forEach(field => {
+      if (field.toLowerCase().includes(keyPattern)) {
+        categoryFields[field] = ejscreenData[field];
+      }
+    });
+    return Object.keys(categoryFields).length > 0 ? categoryFields : null;
+  }
+
+  /**
+   * Fetch and store all facility details from EPA ECHO API
+   */
+  async fetchAndStoreFacilityDetails(registryId, facilityData = {}) {
+    try {
+      console.log(`[INFO] Starting comprehensive data fetch for REGISTRY_ID: ${registryId}`);
+      
+      const FacilityDetails = await this.getFacilityDetailsModel();
+      if (!FacilityDetails) {
+        throw new Error('FacilityDetails model not available');
+      }
+
+      // Always upsert - find existing or create new
+      const iconBaseURL = 'https://echo.epa.gov/themes/custom/echo/images/map/';
+      
+      // Use findOneAndUpdate with upsert option
+      let facilityDetails = await FacilityDetails.findOneAndUpdate(
+        { REGISTRY_ID: registryId },
+        {
+          $setOnInsert: {
+            REGISTRY_ID: registryId,
+            iconBaseURL: iconBaseURL,
+            fetchStatus: new Map(),
+            fetchErrors: new Map(),
+            createdAt: new Date(),
+          },
+          $set: {
+            iconBaseURL: iconBaseURL, // Always update iconBaseURL
+            updatedAt: new Date(),
+          },
+        },
+        { 
+          upsert: true, 
+          new: true,
+          setDefaultsOnInsert: true,
+        }
+      );
+
+      // Initialize Maps if they don't exist
+      if (!facilityDetails.fetchStatus) {
+        facilityDetails.fetchStatus = new Map();
+      }
+      if (!facilityDetails.fetchErrors) {
+        facilityDetails.fetchErrors = new Map();
+      }
+
+      // Extract IDs and coordinates from facility data
+      const npdesId = this.getValue(facilityData, ['NPDES_IDS', 'npdes_ids', 'NPDES_ID', 'npdes_id']);
+      const triFacilityId = this.getValue(facilityData, ['TRIFID', 'trifid', 'TRI_FACILITY_ID', 'tri_facility_id']);
+      const ghgId = this.getValue(facilityData, ['GHG_ID', 'ghg_id', 'GHGID', 'ghgid']);
+      const lat = this.getValue(facilityData, ['FAC_LAT', 'Latitude', 'latitude']);
+      const lng = this.getValue(facilityData, ['FAC_LONG', 'Longitude', 'longitude']);
+
+      // Fetch all program data in parallel
+      const [
+        cwaData,
+        caaData,
+        rcraData,
+        sdwaData,
+        triData,
+        ghgData,
+        ejscreenData,
+      ] = await Promise.allSettled([
+        this.fetchCWAData(registryId, npdesId),
+        this.fetchCAAData(registryId),
+        this.fetchRCRAData(registryId),
+        this.fetchSDWAData(registryId),
+        triFacilityId ? this.fetchTRIData(triFacilityId) : null,
+        ghgId ? this.fetchGHGData(ghgId) : null,
+        (lat && lng) ? this.fetchEJScreenData(lat, lng) : null,
+      ]);
+
+      // Process results and update status with detailed logging
+      if (cwaData.status === 'fulfilled') {
+        console.log(`[INFO] CWA data fetched successfully for REGISTRY_ID: ${registryId}`);
+        console.log(`[INFO] CWA data keys:`, cwaData.value ? Object.keys(cwaData.value) : 'null');
+        facilityDetails.cwa = cwaData.value;
+        facilityDetails.fetchStatus.set('cwa', 'success');
+      } else {
+        console.error(`[ERROR] CWA data fetch failed for REGISTRY_ID: ${registryId}`);
+        console.error(`[ERROR] CWA error:`, cwaData.reason?.message || cwaData.reason);
+        facilityDetails.fetchStatus.set('cwa', 'error');
+        facilityDetails.fetchErrors.set('cwa', cwaData.reason?.message || 'Unknown error');
+      }
+
+      if (caaData.status === 'fulfilled') {
+        console.log(`[INFO] CAA data fetched successfully for REGISTRY_ID: ${registryId}`);
+        console.log(`[INFO] CAA data keys:`, caaData.value ? Object.keys(caaData.value) : 'null');
+        facilityDetails.caa = caaData.value;
+        facilityDetails.fetchStatus.set('caa', 'success');
+      } else {
+        console.error(`[ERROR] CAA data fetch failed for REGISTRY_ID: ${registryId}`);
+        console.error(`[ERROR] CAA error:`, caaData.reason?.message || caaData.reason);
+        facilityDetails.fetchStatus.set('caa', 'error');
+        facilityDetails.fetchErrors.set('caa', caaData.reason?.message || 'Unknown error');
+      }
+
+      if (rcraData.status === 'fulfilled') {
+        console.log(`[INFO] RCRA data fetched successfully for REGISTRY_ID: ${registryId}`);
+        console.log(`[INFO] RCRA data keys:`, rcraData.value ? Object.keys(rcraData.value) : 'null');
+        facilityDetails.rcra = rcraData.value;
+        facilityDetails.fetchStatus.set('rcra', 'success');
+      } else {
+        console.error(`[ERROR] RCRA data fetch failed for REGISTRY_ID: ${registryId}`);
+        console.error(`[ERROR] RCRA error:`, rcraData.reason?.message || rcraData.reason);
+        facilityDetails.fetchStatus.set('rcra', 'error');
+        facilityDetails.fetchErrors.set('rcra', rcraData.reason?.message || 'Unknown error');
+      }
+
+      if (sdwaData.status === 'fulfilled') {
+        facilityDetails.sdwa = sdwaData.value;
+        facilityDetails.fetchStatus.set('sdwa', 'success');
+      } else {
+        facilityDetails.fetchStatus.set('sdwa', 'error');
+        facilityDetails.fetchErrors.set('sdwa', sdwaData.reason?.message || 'Unknown error');
+      }
+
+      if (triData.status === 'fulfilled' && triData.value) {
+        facilityDetails.tri = {
+          facilityInfo: triData.value,
+          triFacilityId: triFacilityId,
+        };
+        facilityDetails.fetchStatus.set('tri', 'success');
+      } else if (triFacilityId) {
+        facilityDetails.fetchStatus.set('tri', 'error');
+        facilityDetails.fetchErrors.set('tri', triData.reason?.message || 'Unknown error');
+      }
+
+      if (ghgData.status === 'fulfilled' && ghgData.value) {
+        facilityDetails.ghg = {
+          facilityInfo: ghgData.value,
+          ghgId: ghgId,
+        };
+        facilityDetails.fetchStatus.set('ghg', 'success');
+      } else if (ghgId) {
+        facilityDetails.fetchStatus.set('ghg', 'error');
+        facilityDetails.fetchErrors.set('ghg', ghgData.reason?.message || 'Unknown error');
+      }
+
+      if (ejscreenData.status === 'fulfilled' && ejscreenData.value) {
+        facilityDetails.ejscreen = ejscreenData.value;
+        facilityDetails.fetchStatus.set('ejscreen', 'success');
+      } else if (lat && lng) {
+        facilityDetails.fetchStatus.set('ejscreen', 'error');
+        facilityDetails.fetchErrors.set('ejscreen', ejscreenData.reason?.message || 'Unknown error');
+      }
+
+      // Set DFR URL
+      facilityDetails.dfrUrl = `https://echo.epa.gov/detailed-facility-report?fid=${registryId}`;
+      facilityDetails.lastFetched = new Date();
+
+      // Always upsert - save to database
+      await facilityDetails.save();
+      console.log(`[INFO] Successfully upserted facility details for REGISTRY_ID: ${registryId}`);
+
+      return facilityDetails;
+    } catch (error) {
+      console.error(`[ERROR] Error fetching/storing facility details for ${registryId}:`, error);
+      throw error;
+    }
+  }
+
+  /**
+   * Extract violations from facility data
+   */
+  extractViolations(facilities) {
+    const violations = [];
+    let violationIdCounter = 1;
+
+    facilities.forEach((facility, index) => {
+      // Database stores data directly on facility, not in facilityData
+      const facilityData = facility;
+      const registryId = String(facility.REGISTRY_ID || facility.FRS_ID || '');
+
+      // Check for violations array
+      const violationsArray = this.getValue(facilityData, [
+        'violations', 'Violations', 'VIOLATIONS', 'violation', 'Violation'
+      ]);
+
+      if (Array.isArray(violationsArray)) {
+        violationsArray.forEach(viol => {
+          violations.push({
+            id: this.getValue(viol, ['id', 'ID', 'violationId', 'violation_id']) || `VIO-${new Date().getFullYear()}-${String(violationIdCounter++).padStart(3, '0')}`,
+            facilityId: registryId,
+            program: this.getValue(viol, ['program', 'Program', 'PROGRAM']) || 
+                    this.getValue(facility.source, ['type', 'Type'])?.toUpperCase() || 'UNKNOWN',
+            violationType: this.getValue(viol, ['violationType', 'type', 'Type', 'violation_type', 'description', 'Description']),
+            type: this.getValue(viol, ['violationType', 'type', 'Type', 'violation_type', 'description', 'Description']),
+            description: this.getValue(viol, ['description', 'Description', 'DESCRIPTION', 'details', 'Details']),
+            date: this.getValue(viol, ['date', 'Date', 'DATE', 'violationDate', 'violation_date']),
+            severity: this.getValue(viol, ['severity', 'Severity', 'SEVERITY', 'level', 'Level']),
+            status: this.getValue(viol, ['status', 'Status', 'STATUS', 'violationStatus', 'violation_status']) || 'Open',
+            penalty: this.getValue(viol, ['penalty', 'Penalty', 'PENALTY', 'fine', 'Fine', 'amount', 'Amount']),
+            fine: this.getValue(viol, ['fine', 'Fine', 'FINE', 'penalty', 'Penalty']),
+            resolved: this.getValue(viol, ['resolved', 'Resolved', 'RESOLVED']) || false,
+            resolvedDate: this.getValue(viol, ['resolvedDate', 'resolved_date', 'resolvedDate', 'resolved_date']),
+            finding: this.getValue(viol, ['finding', 'Finding', 'FINDING', 'result', 'Result']),
+          });
+        });
+      }
+
+      // Check for single violation fields
+      if (facilityData.CURRENT_VIOL === 'Y' || facilityData.currentViol === 'Y' || facilityData.Current_Viol === 'Y') {
+        violations.push({
+          id: `VIO-${new Date().getFullYear()}-${String(violationIdCounter++).padStart(3, '0')}`,
+          facilityId: registryId,
+          program: this.getValue(facility.source, ['type', 'Type'])?.toUpperCase() || 'UNKNOWN',
+          violationType: 'Current Violation',
+          type: 'Current Violation',
+          description: this.getValue(facilityData, ['violationDescription', 'violation_description', 'description', 'Description']) || 'Current violation detected',
+          date: this.getValue(facilityData, ['violationDate', 'violation_date', 'date', 'Date']),
+          severity: 'Significant',
+          status: 'Open',
+          penalty: this.getValue(facilityData, ['penalty', 'Penalty', 'totalPenalties', 'total_penalties']),
+          fine: null,
+          resolved: false,
+          resolvedDate: null,
+          finding: 'Significant Noncompliance',
+        });
+      }
+    });
+
+    return violations;
+  }
+
+  /**
+   * Extract inspections from facility data
+   */
+  extractInspections(facilities) {
+    const inspections = [];
+    let inspectionIdCounter = 1;
+
+    facilities.forEach((facility) => {
+      // Database stores data directly on facility, not in facilityData
+      const facilityData = facility;
+      const registryId = String(facility.REGISTRY_ID || facility.FRS_ID || '');
+
+      // Check for inspections array
+      const inspectionsArray = this.getValue(facilityData, [
+        'inspections', 'Inspections', 'INSPECTIONS', 'inspection', 'Inspection'
+      ]);
+
+      if (Array.isArray(inspectionsArray)) {
+        inspectionsArray.forEach(ins => {
+          inspections.push({
+            id: this.getValue(ins, ['id', 'ID', 'inspectionId', 'inspection_id']) || `INS-${new Date().getFullYear()}-${String(inspectionIdCounter++).padStart(2, '0')}`,
+            facilityId: registryId,
+            date: this.getValue(ins, ['date', 'Date', 'DATE', 'inspectionDate', 'inspection_date']),
+            type: this.getValue(ins, ['type', 'Type', 'TYPE', 'inspectionType', 'inspection_type']),
+            program: this.getValue(ins, ['program', 'Program', 'PROGRAM']) || 
+                    this.getValue(facility.source, ['type', 'Type'])?.toUpperCase() || 'UNKNOWN',
+            findings: this.getValue(ins, ['findings', 'Findings', 'FINDINGS', 'result', 'Result', 'finding', 'Finding']),
+            violations: this.getValue(ins, ['violations', 'Violations', 'violationCount', 'violation_count'], 0),
+            result: this.getValue(ins, ['result', 'Result', 'RESULT', 'findings', 'Findings']),
+            inspector: this.getValue(ins, ['inspector', 'Inspector', 'INSPECTOR', 'inspectorName', 'inspector_name']),
+            summary: this.getValue(ins, ['summary', 'Summary', 'SUMMARY', 'description', 'Description']),
+          });
+        });
+      }
+
+      // Extract inspection dates from facility data
+      const epaInspectionDate = this.getValue(facilityData, [
+        'FAC_DATE_LAST_INSPECTION_EPA', 'fac_date_last_inspection_epa', 
+        'lastInspectionEPA', 'last_inspection_epa', 'epaInspectionDate', 'epa_inspection_date'
+      ]);
+      const stateInspectionDate = this.getValue(facilityData, [
+        'FAC_DATE_LAST_INSPECTION_STATE', 'fac_date_last_inspection_state',
+        'lastInspectionState', 'last_inspection_state', 'stateInspectionDate', 'state_inspection_date'
+      ]);
+
+      if (epaInspectionDate) {
+        inspections.push({
+          id: `INS-${new Date().getFullYear()}-${String(inspectionIdCounter++).padStart(2, '0')}`,
+          facilityId: registryId,
+          date: epaInspectionDate,
+          type: 'Compliance Evaluation Inspection',
+          program: this.getValue(facility.source, ['type', 'Type'])?.toUpperCase() || 'UNKNOWN',
+          findings: this.getValue(facilityData, ['FAC_COMPLIANCE_STATUS', 'fac_compliance_status', 'complianceStatus', 'compliance_status']) || 'No Violations',
+          violations: this.getValue(facilityData, ['violationCount', 'violation_count', 'QTRS_WITH_NC', 'qtrs_with_nc'], 0),
+          result: this.getValue(facilityData, ['FAC_COMPLIANCE_STATUS', 'fac_compliance_status', 'complianceStatus', 'compliance_status']) || 'No Violations',
+          inspector: 'EPA',
+          summary: 'EPA compliance inspection',
+        });
+      }
+
+      if (stateInspectionDate) {
+        inspections.push({
+          id: `INS-${new Date().getFullYear()}-${String(inspectionIdCounter++).padStart(2, '0')}`,
+          facilityId: registryId,
+          date: stateInspectionDate,
+          type: 'State Inspection',
+          program: this.getValue(facility.source, ['type', 'Type'])?.toUpperCase() || 'UNKNOWN',
+          findings: 'No Violations',
+          violations: 0,
+          result: 'No Violations',
+          inspector: 'State EPA',
+          summary: 'State compliance inspection',
+        });
+      }
+    });
+
+    // Sort by date descending
+    return inspections.sort((a, b) => {
+      const dateA = new Date(a.date || 0);
+      const dateB = new Date(b.date || 0);
+      return dateB - dateA;
+    });
+  }
+
+  /**
+   * Extract permits from facility data
+   */
+  extractPermits(facilities) {
+    const permits = [];
+
+    facilities.forEach((facility) => {
+      // Database stores data directly on facility, not in facilityData
+      const facilityData = facility;
+      const sourceType = this.getValue(facility.source, ['type', 'Type'])?.toUpperCase() || '';
+
+      // Check for permits array
+      const permitsArray = this.getValue(facilityData, [
+        'permits', 'Permits', 'PERMITS', 'permit', 'Permit'
+      ]);
+
+      if (Array.isArray(permitsArray)) {
+        permitsArray.forEach(perm => {
+          permits.push({
+            type: this.getValue(perm, ['type', 'Type', 'TYPE', 'permitType', 'permit_type']) || 
+                  (sourceType === 'CWA' ? 'NPDES Permit' : sourceType === 'CAA' ? 'Air Permit' : sourceType === 'RCRA' ? 'RCRA Permit' : 'Permit'),
+            number: this.getValue(perm, ['number', 'Number', 'NUMBER', 'permitNumber', 'permit_number', 'permitno', 'permit_no']),
+            issueDate: this.getValue(perm, ['issueDate', 'issue_date', 'issuedDate', 'issued_date', 'date', 'Date']),
+            expiryDate: this.getValue(perm, ['expiryDate', 'expiry_date', 'expirationDate', 'expiration_date', 'expires', 'Expires']),
+            expirationDate: this.getValue(perm, ['expiryDate', 'expiry_date', 'expirationDate', 'expiration_date', 'expires', 'Expires']),
+            status: this.getValue(perm, ['status', 'Status', 'STATUS', 'permitStatus', 'permit_status']) || 'Active',
+            program: sourceType || this.getValue(perm, ['program', 'Program', 'PROGRAM']),
+          });
+        });
+      }
+
+      // Extract permit info from individual fields
+      const permitNumber = this.getValue(facilityData, [
+        'permitNumber', 'permit_number', 'PERMIT_NUMBER', 'permitno', 'permit_no', 'PERMITNO'
+      ]);
+      if (permitNumber) {
+        permits.push({
+          type: sourceType === 'CWA' ? 'NPDES Permit' : sourceType === 'CAA' ? 'Air Permit' : sourceType === 'RCRA' ? 'RCRA Permit' : 'Permit',
+          number: permitNumber,
+          issueDate: this.getValue(facilityData, ['issueDate', 'issue_date', 'issuedDate', 'issued_date']),
+          expiryDate: this.getValue(facilityData, ['expiryDate', 'expiry_date', 'expirationDate', 'expiration_date']),
+          expirationDate: this.getValue(facilityData, ['expiryDate', 'expiry_date', 'expirationDate', 'expiration_date']),
+          status: 'Active',
+          program: sourceType,
+        });
+      }
+    });
+
+    return permits;
+  }
+
+  /**
+   * Format programs array with code and programDesc
+   */
+  formatPrograms(facilityData) {
+    const programMap = {
+      'NPDES': 'National Pollutant Discharge Elimination System',
+      'CAA': 'Clean Air Act',
+      'RCRA': 'Resource Conservation and Recovery Act',
+      'TRI': 'Toxic Release Inventory',
+      'GHG': 'Greenhouse Gas Reporting',
+      'SDWIS': 'Safe Drinking Water Information System',
+    };
+
+    const programs = [];
+    
+    // Check flags
+    if (this.getValue(facilityData, ['NPDES_FLAG', 'npdes_flag']) === 'Y') {
+      programs.push({ code: 'NPDES', programDesc: programMap['NPDES'] });
+    }
+    if (this.getValue(facilityData, ['AIR_FLAG', 'air_flag']) === 'Y') {
+      programs.push({ code: 'CAA', programDesc: programMap['CAA'] });
+    }
+    if (this.getValue(facilityData, ['RCRA_FLAG', 'rcra_flag']) === 'Y') {
+      programs.push({ code: 'RCRA', programDesc: programMap['RCRA'] });
+    }
+    if (this.getValue(facilityData, ['TRI_FLAG', 'tri_flag']) === 'Y') {
+      programs.push({ code: 'TRI', programDesc: programMap['TRI'] });
+    }
+    if (this.getValue(facilityData, ['GHG_FLAG', 'ghg_flag']) === 'Y') {
+      programs.push({ code: 'GHG', programDesc: programMap['GHG'] });
+    }
+    if (this.getValue(facilityData, ['SDWIS_FLAG', 'sdwis_flag']) === 'Y') {
+      programs.push({ code: 'SDWIS', programDesc: programMap['SDWIS'] });
+    }
+
+    return programs;
+  }
+
+  /**
+   * Format permits with detailed information
+   */
+  formatPermits(facilityData, storedDetails) {
+    if (!facilityData) return [];
+    const permits = [];
+    const programMap = {
+      'CWA': 'National Pollutant Discharge Elimination System',
+      'CAA': 'Clean Air Act',
+      'RCRA': 'Resource Conservation and Recovery Act',
+    };
+
+    // NPDES Permit
+    const npdesId = this.getValue(facilityData, ['NPDES_IDS', 'npdes_ids', 'NPDES_ID', 'npdes_id']);
+    if (npdesId) {
+      const cwaData = storedDetails?.cwa?.facilityInfo;
+      const permitTypes = this.getValue(facilityData, ['CWA_PERMIT_TYPES', 'cwa_permit_types']);
+      
+      permits.push({
+        type: 'NPDES Permit',
+        number: String(npdesId),
+        issueDate: this.extractDateFromEPA(cwaData, 'issueDate', 'ISSUE_DATE') || null,
+        expiryDate: this.extractDateFromEPA(cwaData, 'expiryDate', 'EXPIRE_DATE') || null,
+        expirationDate: this.extractDateFromEPA(cwaData, 'expiryDate', 'EXPIRE_DATE') || null,
+        status: 'Active',
+        program: 'CWA',
+        programDesc: programMap['CWA'],
+        components: permitTypes ? [{ componentType: String(permitTypes), description: String(permitTypes) }] : [],
+        featureCoordinates: this.extractCoordinates(facilityData),
+      });
+    }
+
+    // Air Permit
+    const airId = this.getValue(facilityData, ['AIR_IDS', 'air_ids', 'AIR_ID', 'air_id']);
+    if (airId) {
+      const caaData = storedDetails?.caa?.facilityInfo;
+      permits.push({
+        type: 'Air Permit',
+        number: String(airId),
+        issueDate: this.extractDateFromEPA(caaData, 'issueDate', 'ISSUE_DATE') || null,
+        expiryDate: this.extractDateFromEPA(caaData, 'expiryDate', 'EXPIRE_DATE') || null,
+        expirationDate: this.extractDateFromEPA(caaData, 'expiryDate', 'EXPIRE_DATE') || null,
+        status: 'Active',
+        program: 'CAA',
+        programDesc: programMap['CAA'],
+      });
+    }
+
+    // RCRA Permit
+    const rcraId = this.getValue(facilityData, ['RCRA_IDS', 'rcra_ids', 'RCRA_ID', 'rcra_id']);
+    if (rcraId) {
+      const rcraData = storedDetails?.rcra?.facilityInfo;
+      permits.push({
+        type: 'RCRA Permit',
+        number: String(rcraId),
+        issueDate: this.extractDateFromEPA(rcraData, 'issueDate', 'ISSUE_DATE') || null,
+        expiryDate: this.extractDateFromEPA(rcraData, 'expiryDate', 'EXPIRE_DATE') || null,
+        expirationDate: this.extractDateFromEPA(rcraData, 'expiryDate', 'EXPIRE_DATE') || null,
+        status: 'Active',
+        program: 'RCRA',
+        programDesc: programMap['RCRA'],
+      });
+    }
+
+    return permits;
+  }
+
+  /**
+   * Extract date from EPA API response
+   */
+  extractDateFromEPA(epaData, ...keys) {
+    if (!epaData) return null;
+    const results = Array.isArray(epaData?.Results) ? epaData.Results[0] : epaData?.Results;
+    return this.getValue(results, keys) || null;
+  }
+
+  /**
+   * Extract coordinates for featureCoordinates
+   */
+  extractCoordinates(facilityData) {
+    const lat = this.getValue(facilityData, ['FAC_LAT', 'Latitude', 'latitude']);
+    const lng = this.getValue(facilityData, ['FAC_LONG', 'Longitude', 'longitude']);
+    if (lat && lng) {
+      return [{
+        latitude: parseFloat(lat),
+        longitude: parseFloat(lng),
+        featureNumber: '001',
+      }];
+    }
+    return [];
+  }
+
+  /**
+   * Format violations with detailed information
+   */
+  formatViolations(facilityData, storedDetails) {
+    if (!storedDetails) return [];
+    const violations = [];
+    const registryId = String(facilityData.REGISTRY_ID || facilityData.FRS_ID || '');
+    let violationCounter = 1;
+
+    // Extract from CWA data
+    const cwaViolations = storedDetails?.cwa?.violations;
+    if (cwaViolations?.Results) {
+      const results = Array.isArray(cwaViolations.Results) ? cwaViolations.Results : [cwaViolations.Results];
+      results.forEach(v => {
+        violations.push({
+          id: `VIO-${registryId}-${String(violationCounter++).padStart(3, '0')}`,
+          facilityId: registryId,
+          program: 'NPDES',
+          violationType: v.ViolationType || v.VIOLATION_TYPE || 'Unknown',
+          type: v.ViolationType || v.VIOLATION_TYPE || 'Unknown',
+          description: v.Description || v.DESCRIPTION || '',
+          date: v.ViolationDate || v.VIOLATION_DATE || v.Date || v.DATE,
+          severity: v.Severity || v.SEVERITY || 'Moderate',
+          status: v.Status || v.STATUS || 'Open',
+          penalty: parseFloat(v.Penalty || v.PENALTY || 0),
+          fine: v.Fine || v.FINE || null,
+          resolved: v.Resolved || v.RESOLVED || false,
+          resolvedDate: v.ResolvedDate || v.RESOLVED_DATE || null,
+          finding: v.Finding || v.FINDING || '',
+          violationCode: v.ViolationCode || v.VIOLATION_CODE || null,
+          violationCategory: v.ViolationCategory || v.VIOLATION_CATEGORY || null,
+          qncrHistory: this.extractQncrHistoryFromViolation(v),
+        });
+      });
+    }
+
+    // Extract from CAA data
+    const caaViolations = storedDetails?.caa?.violations;
+    if (caaViolations?.Results) {
+      const results = Array.isArray(caaViolations.Results) ? caaViolations.Results : [caaViolations.Results];
+      results.forEach(v => {
+        violations.push({
+          id: `VIO-${registryId}-${String(violationCounter++).padStart(3, '0')}`,
+          facilityId: registryId,
+          program: 'CAA',
+          violationType: v.ViolationType || v.VIOLATION_TYPE || 'Unknown',
+          type: v.ViolationType || v.VIOLATION_TYPE || 'Unknown',
+          description: v.Description || v.DESCRIPTION || '',
+          date: v.ViolationDate || v.VIOLATION_DATE || v.Date || v.DATE,
+          severity: v.Severity || v.SEVERITY || 'Moderate',
+          status: v.Status || v.STATUS || 'Open',
+          penalty: parseFloat(v.Penalty || v.PENALTY || 0),
+          fine: v.Fine || v.FINE || null,
+          resolved: v.Resolved || v.RESOLVED || false,
+          resolvedDate: v.ResolvedDate || v.RESOLVED_DATE || null,
+          finding: v.Finding || v.FINDING || '',
+          violationCode: v.ViolationCode || v.VIOLATION_CODE || null,
+        });
+      });
+    }
+
+    // Extract from RCRA data
+    const rcraViolations = storedDetails?.rcra?.violations;
+    if (rcraViolations?.Results) {
+      const results = Array.isArray(rcraViolations.Results) ? rcraViolations.Results : [rcraViolations.Results];
+      results.forEach(v => {
+        violations.push({
+          id: `VIO-${registryId}-${String(violationCounter++).padStart(3, '0')}`,
+          facilityId: registryId,
+          program: 'RCRA',
+          violationType: v.ViolationType || v.VIOLATION_TYPE || 'Unknown',
+          type: v.ViolationType || v.VIOLATION_TYPE || 'Unknown',
+          description: v.Description || v.DESCRIPTION || '',
+          date: v.ViolationDate || v.VIOLATION_DATE || v.Date || v.DATE,
+          severity: v.Severity || v.SEVERITY || 'Moderate',
+          status: v.Status || v.STATUS || 'Open',
+          penalty: parseFloat(v.Penalty || v.PENALTY || 0),
+          fine: v.Fine || v.FINE || null,
+          resolved: v.Resolved || v.RESOLVED || false,
+          resolvedDate: v.ResolvedDate || v.RESOLVED_DATE || null,
+          finding: v.Finding || v.FINDING || '',
+        });
+      });
+    }
+
+    return violations;
+  }
+
+  /**
+   * Extract QNCR history from violation
+   */
+  extractQncrHistoryFromViolation(violation) {
+    // This would extract QNCR history if available in violation data
+    return null;
+  }
+
+  /**
+   * Format inspections with detailed information
+   */
+  formatInspections(facilityData, storedDetails) {
+    if (!storedDetails) return [];
+    const inspections = [];
+    const registryId = String(facilityData.REGISTRY_ID || facilityData.FRS_ID || '');
+    let inspectionCounter = 1;
+
+    // Extract from CWA data
+    const cwaInspections = storedDetails?.cwa?.inspections;
+    if (cwaInspections?.Results) {
+      const results = Array.isArray(cwaInspections.Results) ? cwaInspections.Results : [cwaInspections.Results];
+      results.forEach(ins => {
+        inspections.push({
+          id: `INS-${registryId}-${String(inspectionCounter++).padStart(3, '0')}`,
+          facilityId: registryId,
+          date: ins.InspectionDate || ins.INSPECTION_DATE || ins.Date || ins.DATE,
+          type: ins.InspectionType || ins.INSPECTION_TYPE || ins.Type || ins.TYPE || 'Compliance Evaluation Inspection',
+          program: 'NPDES',
+          findings: ins.Findings || ins.FINDINGS || ins.Result || ins.RESULT || 'No Violations',
+          violations: parseInt(ins.Violations || ins.VIOLATIONS || ins.ViolationCount || ins.VIOLATION_COUNT || 0),
+          result: ins.Result || ins.RESULT || ins.Findings || ins.FINDINGS || 'No Violations',
+          inspector: ins.Inspector || ins.INSPECTOR || ins.InspectorName || ins.INSPECTOR_NAME || '',
+          summary: ins.Summary || ins.SUMMARY || ins.Description || ins.DESCRIPTION || '',
+          activityId: ins.ActivityId || ins.ACTIVITY_ID || ins.ActivityID || null,
+          agencyType: ins.AgencyType || ins.AGENCY_TYPE || ins.Agency || ins.AGENCY || 'EPA',
+          monitorType: ins.MonitorType || ins.MONITOR_TYPE || null,
+        });
+      });
+    }
+
+    // Extract from CAA data
+    const caaInspections = storedDetails?.caa?.inspections;
+    if (caaInspections?.Results) {
+      const results = Array.isArray(caaInspections.Results) ? caaInspections.Results : [caaInspections.Results];
+      results.forEach(ins => {
+        inspections.push({
+          id: `INS-${registryId}-${String(inspectionCounter++).padStart(3, '0')}`,
+          facilityId: registryId,
+          date: ins.InspectionDate || ins.INSPECTION_DATE || ins.Date || ins.DATE,
+          type: ins.InspectionType || ins.INSPECTION_TYPE || ins.Type || ins.TYPE || 'Air Site Inspection',
+          program: 'CAA',
+          findings: ins.Findings || ins.FINDINGS || ins.Result || ins.RESULT || 'No Violations',
+          violations: parseInt(ins.Violations || ins.VIOLATIONS || ins.ViolationCount || ins.VIOLATION_COUNT || 0),
+          result: ins.Result || ins.RESULT || ins.Findings || ins.FINDINGS || 'No Violations',
+          inspector: ins.Inspector || ins.INSPECTOR || ins.InspectorName || ins.INSPECTOR_NAME || '',
+          summary: ins.Summary || ins.SUMMARY || ins.Description || ins.DESCRIPTION || '',
+          activityId: ins.ActivityId || ins.ACTIVITY_ID || ins.ActivityID || null,
+          agencyType: ins.AgencyType || ins.AGENCY_TYPE || ins.Agency || ins.AGENCY || 'EPA',
+        });
+      });
+    }
+
+    // Extract from RCRA data
+    const rcraInspections = storedDetails?.rcra?.inspections;
+    if (rcraInspections?.Results) {
+      const results = Array.isArray(rcraInspections.Results) ? rcraInspections.Results : [rcraInspections.Results];
+      results.forEach(ins => {
+        inspections.push({
+          id: `INS-${registryId}-${String(inspectionCounter++).padStart(3, '0')}`,
+          facilityId: registryId,
+          date: ins.InspectionDate || ins.INSPECTION_DATE || ins.Date || ins.DATE,
+          type: ins.InspectionType || ins.INSPECTION_TYPE || ins.Type || ins.TYPE || 'RCRA Compliance Inspection',
+          program: 'RCRA',
+          findings: ins.Findings || ins.FINDINGS || ins.Result || ins.RESULT || 'No Violations',
+          violations: parseInt(ins.Violations || ins.VIOLATIONS || ins.ViolationCount || ins.VIOLATION_COUNT || 0),
+          result: ins.Result || ins.RESULT || ins.Findings || ins.FINDINGS || 'No Violations',
+          inspector: ins.Inspector || ins.INSPECTOR || ins.InspectorName || ins.INSPECTOR_NAME || '',
+          summary: ins.Summary || ins.SUMMARY || ins.Description || ins.DESCRIPTION || '',
+          activityId: ins.ActivityId || ins.ACTIVITY_ID || ins.ActivityID || null,
+          agencyType: ins.AgencyType || ins.AGENCY_TYPE || ins.Agency || ins.AGENCY || 'EPA',
+        });
+      });
+    }
+
+    return inspections;
+  }
+
+  /**
+   * Format enforcement actions with detailed information
+   */
+  formatEnforcementActions(facilityData, storedDetails) {
+    if (!storedDetails) return [];
+    const enforcementActions = [];
+    const registryId = String(facilityData.REGISTRY_ID || facilityData.FRS_ID || '');
+    let enforcementCounter = 1;
+
+    // Extract from CWA data
+    const cwaEnforcement = storedDetails?.cwa?.enforcement;
+    if (cwaEnforcement?.Results) {
+      const results = Array.isArray(cwaEnforcement.Results) ? cwaEnforcement.Results : [cwaEnforcement.Results];
+      results.forEach(enf => {
+        enforcementActions.push({
+          id: `ENF-${registryId}-${String(enforcementCounter++).padStart(3, '0')}`,
+          facilityId: registryId,
+          type: enf.Type || enf.TYPE || enf.EnforcementType || enf.ENFORCEMENT_TYPE || 'Formal',
+          program: 'NPDES',
+          date: enf.Date || enf.DATE || enf.EnforcementDate || enf.ENFORCEMENT_DATE,
+          agency: enf.Agency || enf.AGENCY || enf.AgencyType || enf.AGENCY_TYPE || 'EPA',
+          enfIdentifier: enf.EnfIdentifier || enf.ENF_IDENTIFIER || enf.Identifier || enf.IDENTIFIER || null,
+          activityId: enf.ActivityId || enf.ACTIVITY_ID || enf.ActivityID || null,
+          actionType: enf.ActionType || enf.ACTION_TYPE || enf.Type || enf.TYPE || '',
+          penaltyAmount: parseFloat(enf.PenaltyAmount || enf.PENALTY_AMOUNT || enf.Penalty || enf.PENALTY || 0),
+          description: enf.Description || enf.DESCRIPTION || '',
+          status: enf.Status || enf.STATUS || 'Active',
+        });
+      });
+    }
+
+    // Extract from CAA data
+    const caaEnforcement = storedDetails?.caa?.enforcement;
+    if (caaEnforcement?.Results) {
+      const results = Array.isArray(caaEnforcement.Results) ? caaEnforcement.Results : [caaEnforcement.Results];
+      results.forEach(enf => {
+        enforcementActions.push({
+          id: `ENF-${registryId}-${String(enforcementCounter++).padStart(3, '0')}`,
+          facilityId: registryId,
+          type: enf.Type || enf.TYPE || enf.EnforcementType || enf.ENFORCEMENT_TYPE || 'Informal',
+          program: 'CAA',
+          date: enf.Date || enf.DATE || enf.EnforcementDate || enf.ENFORCEMENT_DATE,
+          agency: enf.Agency || enf.AGENCY || enf.AgencyType || enf.AGENCY_TYPE || 'EPA',
+          enfIdentifier: enf.EnfIdentifier || enf.ENF_IDENTIFIER || enf.Identifier || enf.IDENTIFIER || null,
+          activityId: enf.ActivityId || enf.ACTIVITY_ID || enf.ActivityID || null,
+          actionType: enf.ActionType || enf.ACTION_TYPE || enf.Type || enf.TYPE || '',
+          penaltyAmount: parseFloat(enf.PenaltyAmount || enf.PENALTY_AMOUNT || enf.Penalty || enf.PENALTY || 0),
+          description: enf.Description || enf.DESCRIPTION || '',
+          status: enf.Status || enf.STATUS || 'Active',
+        });
+      });
+    }
+
+    return enforcementActions;
+  }
+
+  /**
+   * Format emissions data
+   */
+  formatEmissions(storedDetails) {
+    if (!storedDetails) return [];
+    const emissions = [];
+    
+    // Extract from TRI data
+    const triData = storedDetails?.tri?.facilityInfo;
+    if (triData?.Results) {
+      const results = Array.isArray(triData.Results) ? triData.Results : [triData.Results];
+      results.forEach(r => {
+        if (r.ChemicalName && r.TotalReleases) {
+          emissions.push({
+            year: parseInt(r.Year || new Date().getFullYear()),
+            pollutant: r.ChemicalName || r.CHEMICAL_NAME,
+            amount: parseFloat(r.TotalReleases || r.TOTAL_RELEASES || 0),
+            unit: r.Unit || r.UNIT || 'lbs',
+            program: 'TRI',
+          });
+        }
+      });
+    }
+
+    // Extract from GHG data
+    const ghgData = storedDetails?.ghg?.facilityInfo;
+    if (ghgData) {
+      // Add GHG emissions if available
+    }
+
+    return emissions;
+  }
+
+  /**
+   * Format stack tests
+   */
+  formatStackTests(storedDetails) {
+    if (!storedDetails) return [];
+    const stackTests = [];
+    const caaData = storedDetails?.caa?.facilityInfo;
+    
+    // Extract stack test data from CAA facility info if available
+    if (caaData?.Results) {
+      const results = Array.isArray(caaData.Results) ? caaData.Results : [caaData.Results];
+      results.forEach(r => {
+        if (r.StackTestDate || r.STACK_TEST_DATE) {
+          stackTests.push({
+            id: `ST-${r.RegistryId || r.REGISTRY_ID}-${stackTests.length + 1}`,
+            facilityId: String(r.RegistryId || r.REGISTRY_ID || ''),
+            date: r.StackTestDate || r.STACK_TEST_DATE,
+            type: 'Stack Test',
+            program: 'CAA',
+            result: r.StackTestResult || r.STACK_TEST_RESULT || 'Pass',
+            pollutants: r.Pollutants ? (Array.isArray(r.Pollutants) ? r.Pollutants : [r.Pollutants]) : [],
+            activityId: r.ActivityId || r.ACTIVITY_ID || null,
+          });
+        }
+      });
+    }
+
+    return stackTests;
+  }
+
+  /**
+   * Format Title V Certifications
+   */
+  formatTitleVCerts(storedDetails) {
+    if (!storedDetails) return [];
+    const titleVCerts = [];
+    const caaData = storedDetails?.caa?.facilityInfo;
+    
+    if (caaData?.Results) {
+      const results = Array.isArray(caaData.Results) ? caaData.Results : [caaData.Results];
+      results.forEach(r => {
+        if (r.TitleVCertDate || r.TITLE_V_CERT_DATE) {
+          titleVCerts.push({
+            id: `TVC-${r.RegistryId || r.REGISTRY_ID}-${titleVCerts.length + 1}`,
+            facilityId: String(r.RegistryId || r.REGISTRY_ID || ''),
+            date: r.TitleVCertDate || r.TITLE_V_CERT_DATE,
+            type: 'Title V Certification',
+            program: 'CAA',
+            status: r.TitleVCertStatus || r.TITLE_V_CERT_STATUS || 'Certified',
+            activityId: r.ActivityId || r.ACTIVITY_ID || null,
+          });
+        }
+      });
+    }
+
+    return titleVCerts;
+  }
+
+  /**
+   * Format pollutants
+   */
+  formatPollutants(storedDetails) {
+    if (!storedDetails) return [];
+    const pollutants = [];
+    
+    // Extract from CAA data
+    const caaData = storedDetails?.caa?.facilityInfo;
+    if (caaData?.Results) {
+      const results = Array.isArray(caaData.Results) ? caaData.Results : [caaData.Results];
+      results.forEach(r => {
+        if (r.PollutantCode || r.POLLUTANT_CODE) {
+          pollutants.push({
+            code: r.PollutantCode || r.POLLUTANT_CODE,
+            name: r.PollutantName || r.POLLUTANT_NAME || '',
+            program: 'CAA',
+            srsId: r.SRSId || r.SRS_ID || null,
+          });
+        }
+      });
+    }
+
+    return pollutants;
+  }
+
+  /**
+   * Format data groups
+   */
+  formatDataGroups(storedDetails) {
+    if (!storedDetails) return [];
+    const dataGroups = [];
+    const cwaData = storedDetails?.cwa?.facilityInfo;
+    
+    if (cwaData?.Results) {
+      const results = Array.isArray(cwaData.Results) ? cwaData.Results : [cwaData.Results];
+      results.forEach(r => {
+        if (r.DataGroupCode || r.DATA_GROUP_CODE) {
+          dataGroups.push({
+            permitNumber: r.PermitNumber || r.PERMIT_NUMBER || r.NPDESId || r.NPDES_ID || '',
+            dataGroupCode: r.DataGroupCode || r.DATA_GROUP_CODE,
+            description: r.DataGroupDescription || r.DATA_GROUP_DESCRIPTION || '',
+            version: parseInt(r.Version || r.VERSION || 0),
+          });
+        }
+      });
+    }
+
+    return dataGroups;
+  }
+
+  /**
+   * Extract enforcement date from stored details
+   */
+  extractEnforcementDate(storedDetails, type, agency) {
+    if (!storedDetails) return null;
+    
+    // Check CWA enforcement
+    const cwaEnf = storedDetails.cwa?.enforcement;
+    if (cwaEnf?.Results) {
+      const results = Array.isArray(cwaEnf.Results) ? cwaEnf.Results : [cwaEnf.Results];
+      const matching = results.filter(r => {
+        const enfType = (r.Type || r.TYPE || '').toLowerCase();
+        const enfAgency = (r.Agency || r.AGENCY || '').toLowerCase();
+        return enfType.includes(type.toLowerCase()) && enfAgency.includes(agency.toLowerCase());
+      });
+      if (matching.length > 0) {
+        return matching[0].Date || matching[0].DATE || matching[0].EnforcementDate || matching[0].ENFORCEMENT_DATE;
+      }
+    }
+    
+    return null;
+  }
+
+  /**
+   * Format QNCR history
+   */
+  formatQncrHistory(facilityData, storedDetails) {
+    const qncrHistory = [];
+    
+    // Extract from CWA 13 quarters history
+    const historyString = this.getValue(facilityData, ['CWA_13QTRS_COMPL_HISTORY', 'cwa_13qtrs_compl_history']);
+    if (historyString && typeof historyString === 'string') {
+      for (let i = 0; i < historyString.length; i++) {
+        const char = historyString[i];
+        const year = new Date().getFullYear();
+        const quarter = Math.floor(i / 4) + 1;
+        const yearQtr = `${year}${quarter}`;
+        
+        qncrHistory.push({
+          yearQtr: yearQtr,
+          status: char === '_' ? 'C' : (char === 'V' ? 'NC' : (char === 'S' ? 'SNC' : char)),
+          numE90Q: char === 'V' || char === 'S' ? 1 : 0,
+          numCvdt: 0,
+        });
+      }
+    }
+
+    return qncrHistory;
+  }
+
+  /**
+   * Format raw data
+   */
+  formatRawData(facilityData) {
+    return {
+      REGISTRY_ID: facilityData.REGISTRY_ID || null,
+      FAC_NAME: facilityData.FAC_NAME || facilityData.FacilityName || null,
+      FAC_STREET: facilityData.FAC_STREET || facilityData.Street || null,
+      FAC_CITY: facilityData.FAC_CITY || facilityData.City || null,
+      FAC_STATE: facilityData.FAC_STATE || facilityData.State || null,
+      FAC_ZIP: facilityData.FAC_ZIP || facilityData.Zip || null,
+      FAC_COUNTY: facilityData.FAC_COUNTY || facilityData.County || null,
+      FAC_FIPS_CODE: facilityData.FAC_FIPS_CODE || null,
+      FAC_EPA_REGION: facilityData.FAC_EPA_REGION || null,
+      FAC_LAT: facilityData.FAC_LAT || facilityData.Latitude || null,
+      FAC_LONG: facilityData.FAC_LONG || facilityData.Longitude || null,
+      FAC_NAICS_CODES: facilityData.FAC_NAICS_CODES || facilityData.NAICS || null,
+      FAC_SIC_CODES: facilityData.FAC_SIC_CODES || facilityData.SIC || null,
+      FAC_COMPLIANCE_STATUS: facilityData.FAC_COMPLIANCE_STATUS || null,
+      FAC_SNC_FLG: facilityData.FAC_SNC_FLG || null,
+      FAC_QTRS_WITH_NC: facilityData.FAC_QTRS_WITH_NC || null,
+      FAC_TOTAL_PENALTIES: facilityData.FAC_TOTAL_PENALTIES || null,
+      FAC_INSPECTION_COUNT: facilityData.FAC_INSPECTION_COUNT || null,
+      FAC_FORMAL_ACTION_COUNT: facilityData.FAC_FORMAL_ACTION_COUNT || null,
+      FAC_INFORMAL_COUNT: facilityData.FAC_INFORMAL_COUNT || null,
+      NPDES_FLAG: facilityData.NPDES_FLAG || null,
+      RCRA_FLAG: facilityData.RCRA_FLAG || null,
+      AIR_FLAG: facilityData.AIR_FLAG || null,
+      TRI_FLAG: facilityData.TRI_FLAG || null,
+      CWA_SNC_FLG: facilityData.CWA_SNC_FLG || null,
+      CWA_QTRS_WITH_NC: facilityData.CWA_QTRS_WITH_NC || null,
+      CWA_COMPLIANCE_STATUS: facilityData.CWA_COMPLIANCE_STATUS || null,
+      NPDES_IDS: facilityData.NPDES_IDS || null,
+      RCRA_IDS: facilityData.RCRA_IDS || null,
+      AIR_IDS: facilityData.AIR_IDS || null,
+      FAC_DATE_LAST_INSPECTION_EPA: facilityData.FAC_DATE_LAST_INSPECTION_EPA || null,
+      FAC_DATE_LAST_INSPECTION_STATE: facilityData.FAC_DATE_LAST_INSPECTION_STATE || null,
+      FAC_DATE_LAST_FORMAL_ACT_EPA: facilityData.FAC_DATE_LAST_FORMAL_ACT_EPA || null,
+      FAC_DATE_LAST_INFORMAL_ACT_EPA: facilityData.FAC_DATE_LAST_INFORMAL_ACT_EPA || null,
+      CWA_PENALTIES: facilityData.CWA_PENALTIES || null,
+      RCRA_PENALTIES: facilityData.RCRA_PENALTIES || null,
+      CAA_PENALTIES: facilityData.CAA_PENALTIES || null,
+      DFR_URL: facilityData.DFR_URL || `http://echo.epa.gov/detailed-facility-report?fid=${facilityData.REGISTRY_ID}`,
+    };
+  }
+
+  /**
+   * Calculate aggregated data with additional fields
+   */
+  calculateAggregatedData(facilityData, violations, inspections) {
+    const lastInspectionEPA = this.getValue(facilityData, ['FAC_DATE_LAST_INSPECTION_EPA', 'fac_date_last_inspection_epa']);
+    const lastFormalActionEPA = this.getValue(facilityData, ['FAC_DATE_LAST_FORMAL_ACT_EPA', 'fac_date_last_formal_act_epa']);
+    
+    // Calculate days since last inspection
+    let daysSinceLastInspection = null;
+    if (lastInspectionEPA) {
+      const lastInspectionDate = new Date(lastInspectionEPA);
+      const today = new Date();
+      daysSinceLastInspection = Math.floor((today - lastInspectionDate) / (1000 * 60 * 60 * 24));
+    }
+
+    // Calculate days since last formal action
+    let daysSinceLastFormalAction = null;
+    if (lastFormalActionEPA) {
+      const lastFormalActionDate = new Date(lastFormalActionEPA);
+      const today = new Date();
+      daysSinceLastFormalAction = Math.floor((today - lastFormalActionDate) / (1000 * 60 * 60 * 24));
+    }
+
+    // Count programs with SNC
+    let programsWithSNC = 0;
+    if (this.getValue(facilityData, ['CWA_SNC_FLG', 'cwa_snc_flg']) === 'Y') programsWithSNC++;
+    if (this.getValue(facilityData, ['CAA_SNC_FLG', 'caa_snc_flg']) === 'Y') programsWithSNC++;
+    if (this.getValue(facilityData, ['RCRA_SNC_FLG', 'rcra_snc_flg']) === 'Y') programsWithSNC++;
+
+    return {
+      totalPenalties: parseFloat(this.getValue(facilityData, ['FAC_TOTAL_PENALTIES', 'fac_total_penalties', 'totalPenalties', 'total_penalties']) || 0),
+      formalActionCount: parseInt(this.getValue(facilityData, ['FAC_FORMAL_ACTION_COUNT', 'fac_formal_action_count', 'formalActionCount', 'formal_action_count']) || 0),
+      informalCount: parseInt(this.getValue(facilityData, ['FAC_INFORMAL_COUNT', 'fac_informal_count', 'informalCount', 'informal_count']) || 0),
+      inspectionCount: parseInt(this.getValue(facilityData, ['FAC_INSPECTION_COUNT', 'fac_inspection_count', 'inspectionCount', 'inspection_count']) || 0),
+      quartersWithNC: parseInt(this.getValue(facilityData, ['FAC_QTRS_WITH_NC', 'fac_qtrs_with_nc', 'QTRS_WITH_NC', 'qtrs_with_nc', 'quartersWithNC', 'quarters_with_nc']) || 0),
+      programsWithSNC: programsWithSNC,
+      daysSinceLastInspection: daysSinceLastInspection,
+      daysSinceLastFormalAction: daysSinceLastFormalAction,
+    };
+  }
+
+  /**
+   * Get comprehensive facility details by REGISTRY_ID
+   * Returns structured data matching the exact format provided
+   */
+  async getFacilityDetails(req, res) {
+    try {
+      const { id } = req.params; // REGISTRY_ID
+      const cleanId = id.trim();
+      console.log(`[DEBUG] Getting comprehensive details for REGISTRY_ID: ${cleanId}`);
+
+      // Get FacilityDetails model and verify connection
+      let FacilityDetails;
+      let conn;
+      try {
+        conn = await this.getDumpConnection();
+        FacilityDetails = await this.getFacilityDetailsModel();
+        
+        if (!FacilityDetails) {
+          return res.status(500).json({
+            success: false,
+            error: 'FacilityDetails model not available on connection',
+          });
+        }
+        
+        // Verify connection is active
+        if (conn.readyState !== 1) {
+          return res.status(500).json({
+            success: false,
+            error: `Database connection not ready. State: ${conn.readyState}`,
+          });
+        }
+        
+        // Test query to verify we can access the database
+        const testCount = await FacilityDetails.countDocuments({}).limit(1);
+        console.log(`[DEBUG] Database connection verified. Collection: ${FacilityDetails.collection.name}, Database: ${conn.db.databaseName}`);
+      } catch (error) {
+        console.error(`[ERROR] Database connection/query error:`, error);
+        return res.status(500).json({
+          success: false,
+          error: `Failed to connect to dump database: ${error.message}`,
+        });
+      }
+
+      // Fetch facility details from facilityDetails collection
+      // Try as both string and number since database might store it either way
+      const searchQueries = [];
+      
+      // Always try as string first
+      searchQueries.push({ REGISTRY_ID: cleanId });
+      searchQueries.push({ REGISTRY_ID: cleanId.toString() });
+      
+      // If ID is numeric, also try as number (database might store as Number type)
+      if (!isNaN(cleanId)) {
+        const numId = parseInt(cleanId);
+        const numIdStr = String(numId);
+        searchQueries.push(
+          { REGISTRY_ID: numId },
+          { REGISTRY_ID: numIdStr },
+        );
+      }
+
+      console.log(`[DEBUG] Searching facilityDetails collection for REGISTRY_ID: ${cleanId}`);
+      console.log(`[DEBUG] Trying ${searchQueries.length} query variations`);
+      
+      let storedFacilityDetails = await FacilityDetails.findOne({ $or: searchQueries }).lean();
+      console.log(`[DEBUG] Found facility details: ${storedFacilityDetails ? 'Yes' : 'No'}`);
+      
+      if (!storedFacilityDetails) {
+        // Try a sample query to see what format REGISTRY_ID is stored in
+        const sample = await FacilityDetails.findOne({ REGISTRY_ID: { $exists: true } }).lean();
+        if (sample) {
+          console.log(`[DEBUG] Sample REGISTRY_ID type: ${typeof sample.REGISTRY_ID}, value: ${sample.REGISTRY_ID}`);
+          
+          // Try matching the exact type
+          if (typeof sample.REGISTRY_ID === 'number') {
+            const numId = parseInt(cleanId);
+            storedFacilityDetails = await FacilityDetails.findOne({ REGISTRY_ID: numId }).lean();
+            console.log(`[DEBUG] Tried as number (${numId}), found: ${storedFacilityDetails ? 'Yes' : 'No'}`);
+          } else if (typeof sample.REGISTRY_ID === 'string') {
+            storedFacilityDetails = await FacilityDetails.findOne({ REGISTRY_ID: cleanId }).lean();
+            console.log(`[DEBUG] Tried as string (${cleanId}), found: ${storedFacilityDetails ? 'Yes' : 'No'}`);
+          }
+        }
+        
+        if (!storedFacilityDetails) {
+          const totalCount = await FacilityDetails.countDocuments({});
+          console.log(`[DEBUG] Total documents in facilityDetails collection: ${totalCount}`);
+          
+          return res.status(404).json({
+            success: false,
+            error: `No facility details found with REGISTRY_ID: ${cleanId}`,
+            debug: {
+              searchedId: cleanId,
+              totalFacilityDetailsInDB: totalCount,
+              collectionName: FacilityDetails.collection.name,
+              databaseName: conn.db.databaseName,
+            },
+          });
+        }
+      }
+
+      // Extract facility data from storedFacilityDetails
+      // The facilityDetails document may have facility info in rawData or we need to extract from the stored data
+      const registryId = String(storedFacilityDetails.REGISTRY_ID || cleanId);
+      
+      // Extract raw facility data - try to get from rawData in stored details, or use storedFacilityDetails itself
+      // If facilityDetails has a rawData field with facility info, use that; otherwise use the document itself
+      const rawFacilityData = storedFacilityDetails.rawData || storedFacilityDetails;
+      
+      // Transform raw data using the transformRawData function
+      const transformedData = transformRawData(rawFacilityData);
+      
+      if (!transformedData) {
+        return res.status(404).json({
+          success: false,
+          error: `Could not transform facility data for REGISTRY_ID: ${cleanId}`,
+        });
+      }
+      
+      // Use transformed data as base
+      const facilityData = rawFacilityData;
+
+      // Use transformed data as the base structure
+      // Then enrich it with data from storedFacilityDetails (violations, inspections, etc.)
+      let facility = transformedData.facility;
+      let complianceScores = transformedData.complianceScores;
+      
+      // Extract and format violations, inspections, and enforcement actions from storedFacilityDetails
+      const violations = this.formatViolations(facilityData, storedFacilityDetails);
+      const inspections = this.formatInspections(facilityData, storedFacilityDetails);
+      const enforcementActions = this.formatEnforcementActions(facilityData, storedFacilityDetails);
+      
+      // Update compliance scores if we have more detailed data
+      if (violations.length > 0 || inspections.length > 0) {
+        // Recalculate scores based on actual violations/inspections
+        complianceScores = {
+          overall: this.calculateComplianceScore(facilityData, 'overall'),
+          air: this.calculateComplianceScore(facilityData, 'air'),
+          water: this.calculateComplianceScore(facilityData, 'water'),
+          waste: this.calculateComplianceScore(facilityData, 'waste'),
+        };
+      }
+      
+      // Merge permits from storedFacilityDetails if available
+      const enrichedPermits = this.formatPermits(facilityData, storedFacilityDetails);
+      if (enrichedPermits.length > 0) {
+        // Merge enriched permits with transformed permits (avoid duplicates)
+        const existingPermitNumbers = new Set(facility.permits.map(p => p.number));
+        enrichedPermits.forEach(permit => {
+          if (!existingPermitNumbers.has(permit.number)) {
+            facility.permits.push(permit);
+          } else {
+            // Update existing permit with enriched data
+            const existingIndex = facility.permits.findIndex(p => p.number === permit.number);
+            if (existingIndex >= 0) {
+              facility.permits[existingIndex] = { ...facility.permits[existingIndex], ...permit };
+            }
+          }
+        });
+      }
+      
+      // Update enforcement actions dates from storedFacilityDetails if available
+      const enrichedEnforcementDates = {
+        lastFormalActionEPA: this.extractEnforcementDate(storedFacilityDetails, 'formal', 'EPA') || facility.enforcementActions.lastFormalActionEPA,
+        lastFormalActionState: this.extractEnforcementDate(storedFacilityDetails, 'formal', 'State') || facility.enforcementActions.lastFormalActionState,
+        lastInformalActionEPA: this.extractEnforcementDate(storedFacilityDetails, 'informal', 'EPA') || facility.enforcementActions.lastInformalActionEPA,
+        lastInformalActionState: this.extractEnforcementDate(storedFacilityDetails, 'informal', 'State') || facility.enforcementActions.lastInformalActionState,
+      };
+      facility.enforcementActions = { ...facility.enforcementActions, ...enrichedEnforcementDates };
+
+      // Parse compliance history
+      const complianceHistory = {
+        threeYear: this.parseComplianceHistory(
+          this.getValue(facilityData, ['FAC_3YR_COMPLIANCE_HISTORY', 'fac_3yr_compliance_history'])
+        ),
+        cwa13Quarters: this.parseComplianceHistory(
+          this.getValue(facilityData, ['CWA_13QTRS_COMPL_HISTORY', 'cwa_13qtrs_compl_history'])
+        ),
+      };
+
+      // Derive geolocation details
+      const lat = this.getValue(facilityData, ['FAC_LAT', 'Latitude', 'latitude']);
+      const lng = this.getValue(facilityData, ['FAC_LONG', 'Longitude', 'longitude']);
+      const geolocation = {
+        latitude: lat,
+        longitude: lng,
+        maps: this.generateMapUrl(lat, lng),
+        epaRegion: this.getValue(facilityData, ['FAC_EPA_REGION', 'fac_epa_region']),
+        epaRegionName: this.getEPARegionName(
+          this.getValue(facilityData, ['FAC_EPA_REGION', 'fac_epa_region'])
+        ),
+        county: this.getValue(facilityData, ['FAC_COUNTY', 'County', 'county']),
+        huc: this.getValue(facilityData, ['FAC_DERIVED_HUC', 'fac_derived_huc']),
+        watershed: this.getValue(facilityData, ['FAC_DERIVED_WBD', 'fac_derived_wbd']),
+      };
+
+      // Derive program flags
+      const programFlags = {
+        air: this.getValue(facilityData, ['AIR_FLAG', 'air_flag']) === 'Y',
+        npdes: this.getValue(facilityData, ['NPDES_FLAG', 'npdes_flag']) === 'Y',
+        sdwis: this.getValue(facilityData, ['SDWIS_FLAG', 'sdwis_flag']) === 'Y',
+        rcra: this.getValue(facilityData, ['RCRA_FLAG', 'rcra_flag']) === 'Y',
+        tri: this.getValue(facilityData, ['TRI_FLAG', 'tri_flag']) === 'Y',
+        ghg: this.getValue(facilityData, ['GHG_FLAG', 'ghg_flag']) === 'Y',
+      };
+
+
+      // Add iconBaseURL to icon data if present
+      const iconBaseURL = storedFacilityDetails?.iconBaseURL || 'https://echo.epa.gov/themes/custom/echo/images/map/';
+      
+      // Add iconBaseURL to facility object
+      facility.iconBaseURL = iconBaseURL;
+      
+      // Process all icon fields and add full URLs
+      const iconFields = ['FAC_MAP_ICON', 'fac_map_icon', 'MapIcon', 'mapIcon', 'ICON', 'icon'];
+      iconFields.forEach(field => {
+        const iconValue = facilityData[field];
+        if (iconValue && typeof iconValue === 'string' && !iconValue.startsWith('http')) {
+          facilityData[`${field}_URL`] = `${iconBaseURL}${iconValue}`;
+          // Also add to facility object if it's the main icon
+          if (field === 'FAC_MAP_ICON' || field === 'fac_map_icon') {
+            facility.mapIcon = iconValue;
+            facility.mapIconURL = `${iconBaseURL}${iconValue}`;
+          }
+        }
+      });
+
+      // Get NPDES ID from facility data
+      const npdesId = this.getValue(facilityData, ['NPDES_IDS', 'npdes_ids', 'NPDES_ID', 'npdes_id']);
+
+      // Build enriched data object
+      const enrichedData = {
+        iconBaseURL: iconBaseURL,
+        programFlags,
+        complianceHistory,
+        geolocation,
+        npdesDetails: npdesId ? {
+          npdesId: npdesId,
+          permitTypes: this.getValue(facilityData, ['CWA_PERMIT_TYPES', 'cwa_permit_types']),
+        } : null,
+        dfrUrl: storedFacilityDetails?.dfrUrl || `https://echo.epa.gov/detailed-facility-report?fid=${registryId}`,
+      };
+
+      // Build comprehensive facility details from stored data
+      const comprehensiveDetails = storedFacilityDetails ? {
+        cwa: storedFacilityDetails.cwa || null,
+        caa: storedFacilityDetails.caa || null,
+        rcra: storedFacilityDetails.rcra || null,
+        sdwa: storedFacilityDetails.sdwa || null,
+        tri: storedFacilityDetails.tri || null,
+        ghg: storedFacilityDetails.ghg || null,
+        ejscreen: storedFacilityDetails.ejscreen || null,
+        fetchStatus: Object.fromEntries(storedFacilityDetails.fetchStatus || new Map()),
+        fetchErrors: Object.fromEntries(storedFacilityDetails.fetchErrors || new Map()),
+        lastFetched: storedFacilityDetails.lastFetched,
+      } : null;
+
+      // Build rawData object - use the facility data from facilityDetails
+      const rawData = this.formatRawData(facilityData);
+
+      // Format response to match exact structure
+      // Use transformed data as base and enrich with additional data from storedFacilityDetails
+      const formattedResponse = {
+        _id: transformedData._id,
+        REGISTRY_ID: transformedData.REGISTRY_ID,
+        facility,
+        violations: violations.length > 0 ? violations : transformedData.violations,
+        inspections: inspections.length > 0 ? inspections : transformedData.inspections,
+        complianceScores,
+        enforcementActions: enforcementActions.length > 0 ? enforcementActions : transformedData.enforcementActions,
+        emissions: this.formatEmissions(storedFacilityDetails).length > 0 ? this.formatEmissions(storedFacilityDetails) : transformedData.emissions,
+        stackTests: this.formatStackTests(storedFacilityDetails).length > 0 ? this.formatStackTests(storedFacilityDetails) : transformedData.stackTests,
+        titleVCerts: this.formatTitleVCerts(storedFacilityDetails).length > 0 ? this.formatTitleVCerts(storedFacilityDetails) : transformedData.titleVCerts,
+        pollutants: this.formatPollutants(storedFacilityDetails).length > 0 ? this.formatPollutants(storedFacilityDetails) : transformedData.pollutants,
+        dataGroups: this.formatDataGroups(storedFacilityDetails).length > 0 ? this.formatDataGroups(storedFacilityDetails) : transformedData.dataGroups,
+        qncrHistory: this.formatQncrHistory(facilityData, storedFacilityDetails).length > 0 ? this.formatQncrHistory(facilityData, storedFacilityDetails) : transformedData.qncrHistory,
+        rawData: transformedData.rawData,
+      };
+
+      res.json(formattedResponse);
+    } catch (error) {
+      console.error(`[ERROR] Error in getFacilityDetails:`, error);
+      res.status(500).json({
+        success: false,
+        error: error.message,
+      });
+    }
+  }
+
+  /**
+   * Calculate compliance score (0-10 scale)
+   */
+  calculateComplianceScore(facilityData, type) {
+    let score = 10; // Start with perfect score
+
+    // Deduct points for violations
+    const violationCount = parseFloat(this.getValue(facilityData, [
+      'violationCount', 'violation_count', 'QTRS_WITH_NC', 'qtrs_with_nc'
+    ]) || 0);
+    score -= violationCount * 0.5;
+
+    // Deduct for non-compliance
+    const complianceStatus = String(this.getValue(facilityData, [
+      'FAC_COMPLIANCE_STATUS', 'fac_compliance_status', 'complianceStatus', 'compliance_status'
+    ]) || '').toLowerCase();
+    if (complianceStatus.includes('noncompliant') || complianceStatus.includes('snc')) {
+      score -= 3;
+    }
+
+    // Deduct for penalties
+    const penalties = parseFloat(this.getValue(facilityData, [
+      'FAC_TOTAL_PENALTIES', 'fac_total_penalties', 'totalPenalties', 'total_penalties'
+    ]) || 0);
+    if (penalties > 0) {
+      score -= Math.min(2, penalties / 50000); // Max 2 point deduction
+    }
+
+    return parseFloat(Math.max(0, Math.min(10, score)).toFixed(1));
   }
 
   /**

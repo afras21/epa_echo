@@ -36,8 +36,24 @@ router.post('/', (req, res) => facilityController.insertFacilities(req, res));
 router.get('/', (req, res) => facilityController.getAllFacilities(req, res));
 
 /**
+ * GET /api/facilities/statistics
+ * Get facility statistics and analytics
+ * Returns: total count, high-risk count, active violations, non-compliant count, top 3 high-risk facilities
+ */
+router.get('/statistics', (req, res) => facilityController.getFacilityStatistics(req, res));
+
+/**
+ * GET /api/facilities/:id/details
+ * Get comprehensive facility details by REGISTRY_ID
+ * Combines all data from Water, Air, RCRA, Enforcement, Permits, FRS, Air Emissions
+ * NOTE: This route must come before /:id to avoid route conflicts
+ */
+router.get('/:id/details', (req, res) => facilityController.getFacilityDetails(req, res));
+
+/**
  * GET /api/facilities/:id
  * Get a specific facility by ID (FRS ID or facility name)
+ * NOTE: This route must come last to avoid matching /statistics or /:id/details
  */
 router.get('/:id', (req, res) => facilityController.getFacilityById(req, res));
 

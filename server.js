@@ -60,7 +60,9 @@ app.get('/', (req, res) => {
     endpoints: {
       health: '/health',
       facilities: 'GET /api/facilities (list all facilities with filtering & pagination)',
+      facilityStatistics: 'GET /api/facilities/statistics (dashboard statistics)',
       facilityById: 'GET /api/facilities/:id',
+      facilityDetails: 'GET /api/facilities/:id/details (comprehensive details from all sources)',
     },
     examples: {
       'Get all facilities': '/api/facilities?limit=50',
@@ -68,6 +70,8 @@ app.get('/', (req, res) => {
       'Filter by city and state': '/api/facilities?state=CA&city=Los%20Angeles&limit=50',
       'Filter by ZIP': '/api/facilities?zip=90210',
       'Get facility by ID': '/api/facilities/110000123456',
+      'Get comprehensive facility details': '/api/facilities/110045817167/details',
+      'Get facility statistics': '/api/facilities/statistics',
     },
   });
 });

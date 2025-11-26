@@ -9,7 +9,7 @@ const connectDumpDB = async () => {
       throw new Error('MONGODB_DUMP_URI is not set in environment variables');
     }
     
-    const dbName = 'epaDump';
+    const dbName = 'epaData';
     
     // Ensure database name is in the connection string
     // If URI doesn't end with a database name, add it
@@ -56,7 +56,7 @@ const connectDumpDB = async () => {
 1. MONGODB_DUMP_URI is correct: ${mongoUri.replace(/:[^:@]+@/, ':****@')}
 2. Network connectivity to MongoDB
 3. MongoDB cluster is accessible
-4. Database name is correct: epaDump`));
+4. Database name is correct: epaData`));
       }, 30000); // 30 second timeout
       
       conn.once('connected', () => {
@@ -80,6 +80,10 @@ const connectDumpDB = async () => {
     const FacilityModule = require('../models/Facility');
     const Facility = FacilityModule.createModel(conn);
     
+    // Create FacilityDetails model on this connection
+    const FacilityDetailsModule = require('../models/FacilityDetails');
+    const FacilityDetails = FacilityDetailsModule.createModel(conn);
+    
     const collectionName = 'facilities';
     
     // Get actual database name from connection
@@ -92,8 +96,9 @@ const connectDumpDB = async () => {
     console.log(`  Collection: ${collectionName}`);
     console.log(`  Connection String: ${mongoUri.replace(/:[^:@]+@/, ':****@')}\n`);
     
-    // Store Facility model on connection for easy access
+    // Store models on connection for easy access
     conn.Facility = Facility;
+    conn.FacilityDetails = FacilityDetails;
     
     return conn;
   } catch (error) {

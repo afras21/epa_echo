@@ -4,18 +4,27 @@ const mongoose = require('mongoose');
 let dumpConnection = null;
 
 const FacilitySchema = new mongoose.Schema({
-  // Facility identification
-  REGISTRY_ID: String, // Primary facility identifier (Registry ID)
-  FRS_ID: String, // Alternative/legacy field
+  // Facility identification - support both String and Number for REGISTRY_ID
+  REGISTRY_ID: mongoose.Schema.Types.Mixed, // Can be String or Number
+  FRS_ID: mongoose.Schema.Types.Mixed, // Can be String or Number
   FacilityName: String,
+  FAC_NAME: String, // Actual database field name
   City: String,
+  FAC_CITY: String, // Actual database field name
   State: String,
+  FAC_STATE: String, // Actual database field name
   Zip: String,
+  FAC_ZIP: String, // Actual database field name
   County: String,
+  FAC_COUNTY: String, // Actual database field name
+  Street: String,
+  FAC_STREET: String, // Actual database field name
   
   // Location coordinates
   Latitude: Number,
+  FAC_LAT: Number, // Actual database field name
   Longitude: Number,
+  FAC_LONG: Number, // Actual database field name
   
   // Codes
   SIC: String,
@@ -48,6 +57,7 @@ const FacilitySchema = new mongoose.Schema({
   },
 }, {
   collection: 'facilities', // Explicit collection name
+  strict: false, // Allow fields not defined in schema
 });
 
 // Indexes for efficient queries
