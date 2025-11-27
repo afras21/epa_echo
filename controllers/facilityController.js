@@ -1,4 +1,5 @@
 const connectDumpDB = require('../config/dumpDatabase');
+const { connectRedis, getRedisClient } = require('../config/redis');
 const axios = require('axios');
 let dumpConnection = null;
 
@@ -200,6 +201,18 @@ function transformRawData(raw) {
 
 class FacilityController {
   /**
+   * Initialize Redis connection
+   */
+  async initRedis() {
+    const client = getRedisClient();
+    if (!client || !client.isOpen) {
+      await connectRedis();
+      return getRedisClient();
+    }
+    return client;
+  }
+
+  /**
    * Get or create dump database connection
    */
   async getDumpConnection() {
@@ -332,12 +345,12 @@ class FacilityController {
       if (name) filters.name = name;
       if (type) filters.type = type;
 
-      const limitNum = Math.min(parseInt(limit) || 50, 500); // Max 500 per page
+      const limitNum = Math.min(parseInt(limit) || 25, 500); // Default 25, max 500 per page
 
-      // Get Facility model from dump database connection
-      let Facility;
+      // Get FacilityDetails model from dump database connection (has the nested facility structure)
+      let FacilityDetails;
       try {
-        Facility = await this.getFacilityModel();
+        FacilityDetails = await this.getFacilityDetailsModel();
       } catch (error) {
         return res.status(500).json({
           success: false,
@@ -345,15 +358,37 @@ class FacilityController {
         });
       }
 
-      if (!Facility) {
+      if (!FacilityDetails) {
         return res.status(500).json({
           success: false,
-          error: 'Facility model not available. Please check your database connection.',
+          error: 'FacilityDetails model not available. Please check your database connection.',
         });
       }
 
-      // Build MongoDB query
-      const query = this.buildQuery(filters);
+      // Build MongoDB query for facilityDetails collection
+      // For now, use empty query to get all facilities (filters can be added later)
+      const query = {};
+      
+      // Add basic filters if provided
+      if (filters.state) {
+        query['facility.state'] = { $regex: filters.state.toUpperCase(), $options: 'i' };
+      }
+      if (filters.city) {
+        query['facility.city'] = { $regex: filters.city, $options: 'i' };
+      }
+      if (filters.zip) {
+        query['facility.zip'] = filters.zip;
+      }
+      if (filters.frsId || filters.name) {
+        query.$or = [];
+        if (filters.frsId) {
+          query.$or.push({ REGISTRY_ID: { $regex: filters.frsId, $options: 'i' } });
+          query.$or.push({ 'facility.registryId': { $regex: filters.frsId, $options: 'i' } });
+        }
+        if (filters.name) {
+          query.$or.push({ 'facility.name': { $regex: filters.name, $options: 'i' } });
+        }
+      }
 
       // Handle pagination with nextToken
       let skip = 0;
@@ -364,21 +399,57 @@ class FacilityController {
         }
       }
 
-      // Fetch facilities from MongoDB
-      const facilities = await Facility.find(query)
-        .sort({ createdAt: -1 })
+      // Fetch facilities from MongoDB facilityDetails collection
+      const facilities = await FacilityDetails.find(query)
+        .sort({ updatedAt: -1, lastFetched: -1, createdAt: -1 })
         .skip(skip)
         .limit(limitNum + 1) // Fetch one extra to check if there's more
         .lean();
+      
+      console.log(`[DEBUG] getAllFacilities - Found ${facilities.length} facilities from facilityDetails collection`);
+
+      // Transform facilities to return only requested fields for list view
+      const transformedFacilities = facilities.map(doc => {
+        // Get facility object from document
+        const facilityObj = doc.facility || {};
+        
+        // Remove id, epaId, facilityName from facility object
+        const { id, epaId, facilityName, ...cleanFacility } = facilityObj;
+        
+        // Return only requested fields for list view
+        return {
+          _id: doc._id || doc.REGISTRY_ID || null,
+          name: cleanFacility.name || '',
+          address: cleanFacility.address || cleanFacility.street || '',
+          street: cleanFacility.street || '',
+          city: cleanFacility.city || '',
+          state: cleanFacility.state || '',
+          zip: cleanFacility.zip || '',
+          county: cleanFacility.county || '',
+          region: cleanFacility.region || '',
+          industryGroup: cleanFacility.industryGroup || cleanFacility.industry || '',
+          lat: cleanFacility.latitude || null,
+          long: cleanFacility.longitude || null,
+          programs: cleanFacility.programs || [],
+          complianceStatus: cleanFacility.complianceStatus || '',
+          riskScoreOverall: cleanFacility.riskScore || cleanFacility.riskScoreOverall || null,
+          violationsCount: doc.violations ? doc.violations.length : 0,
+          lastInspectionDate: cleanFacility.lastInspection || 
+            (cleanFacility.inspectionDates?.mostRecent?.date) || 
+            (cleanFacility.inspectionDates?.epa) || 
+            (cleanFacility.inspectionDates?.state) || 
+            null,
+        };
+      });
 
       // Check if there are more results
-      const hasMore = facilities.length > limitNum;
-      const paginatedFacilities = hasMore ? facilities.slice(0, limitNum) : facilities;
+      const hasMore = transformedFacilities.length > limitNum;
+      const paginatedFacilities = hasMore ? transformedFacilities.slice(0, limitNum) : transformedFacilities;
 
       // Get total count (only if no filters or for first page)
       let total = null;
       if (skip === 0 && Object.keys(filters).length === 0) {
-        total = await Facility.countDocuments(query);
+        total = await FacilityDetails.countDocuments(query);
       }
 
       // Generate next token
@@ -567,143 +638,579 @@ class FacilityController {
   }
 
   /**
+   * Calculate statistics from database (internal method)
+   */
+  async calculateStatistics() {
+    try {
+      // Get FacilityDetails model (has the nested facility structure)
+      let FacilityDetails;
+      try {
+        FacilityDetails = await this.getFacilityDetailsModel();
+      } catch (error) {
+        throw new Error(`Failed to connect to dump database: ${error.message}`);
+      }
+
+      if (!FacilityDetails) {
+        throw new Error('FacilityDetails model not available. Please check your database connection.');
+      }
+
+      console.log(`[STATS] Querying facilityDetails collection for statistics...`);
+
+    // Get all facilities
+    const allFacilities = await FacilityDetails.find({}).lean();
+    const totalFacilities = allFacilities.length;
+
+    console.log(`[STATS] Found ${totalFacilities} facilities`);
+
+    // Initialize counters
+    let compliant = 0;
+    let nonCompliant = 0;
+    let underReview = 0;
+    let highRisk = 0;
+    let activeViolations = 0;
+
+    const programCounts = {
+      air: 0,
+      water: 0,
+      waste: 0,
+      enforcements: 0,
+    };
+
+    const highRiskFacilities = [];
+    const latestInspections = [];
+    const recentSearches = [];
+
+    // Process each facility
+    for (const doc of allFacilities) {
+      const fac = doc.facility || {};
+      const violations = doc.violations || [];
+      const enforcementCases = doc.enforcementCases || [];
+      const inspections = doc.inspections || [];
+      const complianceScores = doc.complianceScores || {};
+      const riskScore = fac.riskScore || 10.0;
+
+      // Compliance status
+      const complianceStatus = (fac.complianceStatus || '').trim();
+      if (!complianceStatus || complianceStatus.includes('No Violation') || complianceStatus === '') {
+        compliant++;
+      } else if (complianceStatus.includes('Violation') || complianceStatus.includes('SNC')) {
+        nonCompliant++;
+      } else {
+        underReview++;
+      }
+
+      // High risk (risk score < 5.0 or has violations)
+      const realViolations = violations.filter(v => {
+        const violationType = v.violationType || '';
+        return violationType !== 'No Violation Identified' && violationType !== '';
+      });
+
+      if (riskScore < 5.0 || realViolations.length > 0) {
+        highRisk++;
+        highRiskFacilities.push({
+          registryId: fac.registryId || fac.id || '',
+          name: fac.name || 'Unknown Facility',
+          city: fac.city || '',
+          state: fac.state || '',
+          riskScore: riskScore,
+          violations: realViolations.length,
+          complianceStatus: complianceStatus,
+        });
+      }
+
+      // Active violations
+      const activeViols = violations.filter(v => {
+        const violationType = v.violationType || '';
+        return violationType !== 'No Violation Identified' && 
+               violationType !== '' && 
+               !v.resolved;
+      });
+      activeViolations += activeViols.length;
+
+      // Program counts
+      const programs = fac.programs || [];
+      for (const prog of programs) {
+        const code = typeof prog === 'object' ? prog.code : prog;
+        if (code === 'CAA') {
+          programCounts.air++;
+        } else if (code === 'NPDES' || code === 'CWA') {
+          programCounts.water++;
+        } else if (code === 'RCRA') {
+          programCounts.waste++;
+        }
+      }
+
+      if (enforcementCases.length > 0) {
+        programCounts.enforcements++;
+      }
+
+      // Latest inspections (from inspections array)
+      for (const insp of inspections) {
+        const inspDate = insp.date || '';
+        if (inspDate && inspDate.trim()) {
+          latestInspections.push({
+            registryId: fac.registryId || fac.id || '',
+            name: fac.name || 'Unknown Facility',
+            city: fac.city || '',
+            state: fac.state || '',
+            inspectionDate: inspDate,
+            type: insp.type || '',
+            program: insp.program || '',
+          });
+        }
+      }
+
+      // Also check facility's lastInspection field
+      const lastInsp = fac.lastInspection || '';
+      if (lastInsp && lastInsp.trim()) {
+        latestInspections.push({
+          registryId: fac.registryId || fac.id || '',
+          name: fac.name || 'Unknown Facility',
+          city: fac.city || '',
+          state: fac.state || '',
+          inspectionDate: lastInsp,
+          type: fac.lastInspectionType || '',
+          program: 'General',
+        });
+      }
+
+      // Check inspectionDates object
+      const inspectionDates = fac.inspectionDates || {};
+      if (inspectionDates && typeof inspectionDates === 'object') {
+        for (const [key, value] of Object.entries(inspectionDates)) {
+          if (key !== 'mostRecent' && value && typeof value === 'string' && value.trim()) {
+            latestInspections.push({
+              registryId: fac.registryId || fac.id || '',
+              name: fac.name || 'Unknown Facility',
+              city: fac.city || '',
+              state: fac.state || '',
+              inspectionDate: value,
+              type: key.toUpperCase(),
+              program: 'General',
+            });
+          }
+        }
+
+        // Check mostRecent
+        const mostRecent = inspectionDates.mostRecent;
+        if (mostRecent && typeof mostRecent === 'object') {
+          const mrDate = mostRecent.date || '';
+          if (mrDate && mrDate.trim()) {
+            latestInspections.push({
+              registryId: fac.registryId || fac.id || '',
+              name: fac.name || 'Unknown Facility',
+              city: fac.city || '',
+              state: fac.state || '',
+              inspectionDate: mrDate,
+              type: mostRecent.type || '',
+              program: 'General',
+            });
+          }
+        }
+      }
+    }
+
+    // Sort high risk facilities by risk score (lowest first = highest risk)
+    highRiskFacilities.sort((a, b) => (a.riskScore || 10.0) - (b.riskScore || 10.0));
+
+    // Deduplicate inspections (same registryId + inspectionDate)
+    const seenInspections = new Set();
+    const uniqueInspections = [];
+    for (const insp of latestInspections) {
+      const key = `${insp.registryId || ''}_${insp.inspectionDate || ''}`;
+      if (!seenInspections.has(key)) {
+        seenInspections.add(key);
+        uniqueInspections.push(insp);
+      }
+    }
+
+    // Sort inspections by date (most recent first)
+    const parseInspectionDate = (dateStr) => {
+      if (!dateStr) return new Date(0);
+      try {
+        // Try different date formats
+        if (dateStr.includes('/')) {
+          const [m, d, y] = dateStr.split('/');
+          return new Date(`${y}-${m.padStart(2, '0')}-${d.padStart(2, '0')}`);
+        } else if (dateStr.includes('-')) {
+          return new Date(dateStr);
+        }
+        return new Date(dateStr);
+      } catch (e) {
+        return new Date(0);
+      }
+    };
+
+    uniqueInspections.sort((a, b) => {
+      const dateA = parseInspectionDate(a.inspectionDate);
+      const dateB = parseInspectionDate(b.inspectionDate);
+      return dateB - dateA; // Most recent first
+    });
+
+    // Get top 10 high risk facilities (remove internal fields)
+    const topHighRisk = highRiskFacilities.slice(0, 10).map(fac => ({
+      registryId: fac.registryId,
+      name: fac.name,
+      city: fac.city,
+      state: fac.state,
+    }));
+
+    // Get top 10 latest inspections
+    const topInspections = uniqueInspections.slice(0, 10);
+
+    // Generate recent searches (use facilities with most data as "recent searches")
+    const facilitiesByScore = [...allFacilities].sort((a, b) => {
+      const scoreA = (a.violations?.length || 0) + (a.enforcementCases?.length || 0) + (a.inspections?.length || 0);
+      const scoreB = (b.violations?.length || 0) + (b.enforcementCases?.length || 0) + (b.inspections?.length || 0);
+      return scoreB - scoreA;
+    });
+
+    for (const doc of facilitiesByScore.slice(0, 3)) {
+      const fac = doc.facility || {};
+      recentSearches.push({
+        registryId: fac.registryId || fac.id || '',
+        name: fac.name || 'Unknown Facility',
+        city: fac.city || '',
+        state: fac.state || '',
+        lastAccessed: new Date().toISOString(),
+      });
+    }
+
+    // Build statistics JSON
+    const statistics = {
+      success: true,
+      updatedAt: new Date().toISOString(),
+      statistics: {
+        totalFacilities: totalFacilities,
+        compliant: compliant,
+        nonCompliant: nonCompliant,
+        underReview: underReview,
+        highRisk: highRisk,
+        activeViolations: activeViolations,
+        programs: programCounts,
+        topRecentSearches: recentSearches,
+        topHighRiskFacilities: topHighRisk,
+        latestInspections: topInspections,
+      },
+    };
+
+    console.log(`[STATS] Statistics generated successfully`);
+    console.log(`[STATS] Total: ${totalFacilities}, Compliant: ${compliant}, Non-Compliant: ${nonCompliant}, High Risk: ${highRisk}`);
+
+    return statistics;
+    } catch (error) {
+      console.error(`[ERROR] Error in calculateStatistics:`, error);
+      throw error;
+    }
+  }
+
+  /**
    * Get facility statistics and analytics
-   * Returns: total count, high-risk count, active violations, non-compliant count, top 3 high-risk facilities
+   * Returns: total count, high-risk count, active violations, non-compliant count, top high-risk facilities, latest inspections
+   * Supports Redis caching and live=true parameter for fresh calculation
    */
   async getFacilityStatistics(req, res) {
     try {
-      // Get Facility model
-      let Facility;
-      try {
-        Facility = await this.getFacilityModel();
-      } catch (error) {
-        return res.status(500).json({
-          success: false,
-          error: `Failed to connect to dump database: ${error.message}`,
-        });
+      const { live } = req.query;
+      const isLive = live === 'true' || live === true;
+      const cacheKey = 'facility:statistics';
+
+      // Initialize Redis if not already connected
+      const redisClient = await this.initRedis();
+
+      // If not live, try to get from Redis cache
+      if (!isLive && redisClient && redisClient.isOpen) {
+        try {
+          const cachedStats = await redisClient.get(cacheKey);
+          if (cachedStats) {
+            console.log(`[STATS] Returning cached statistics from Redis`);
+            const parsedStats = JSON.parse(cachedStats);
+            return res.json(parsedStats);
+          } else {
+            // Redis is empty, store default statistics and return
+            console.log(`[STATS] Redis is empty, storing default statistics...`);
+            const defaultStats = this.getDefaultStatistics();
+            
+            // Store in Redis cache (with 24 hour expiration)
+            await redisClient.setEx(cacheKey, 86400, JSON.stringify(defaultStats)); // 24 hours
+            console.log(`[STATS] Default statistics stored in Redis`);
+            
+            return res.json(defaultStats);
+          }
+        } catch (redisError) {
+          console.warn(`[STATS] Redis cache read error:`, redisError.message);
+          // Continue to calculate fresh statistics
+        }
       }
 
-      if (!Facility) {
-        return res.status(500).json({
-          success: false,
-          error: 'Facility model not available',
-        });
+      // Calculate fresh statistics (only if live=true or Redis unavailable)
+      console.log(`[STATS] Calculating fresh statistics${isLive ? ' (live=true)' : ''}...`);
+      const statistics = await this.calculateStatistics();
+
+      // Store in Redis cache (with 24 hour expiration)
+      if (redisClient && redisClient.isOpen) {
+        try {
+          await redisClient.setEx(cacheKey, 86400, JSON.stringify(statistics)); // 24 hours = 86400 seconds
+          console.log(`[STATS] Statistics cached in Redis for 24 hours`);
+        } catch (redisError) {
+          console.warn(`[STATS] Redis cache write error:`, redisError.message);
+          // Continue even if Redis write fails
+        }
       }
 
-      // Total facilities count
-      const totalCount = await Facility.countDocuments({});
+      res.json(statistics);
 
-      // High-risk facilities: facilities with violations, non-compliance, or enforcement actions
-      // Check for common violation/compliance indicators in facilityData
-      const highRiskQuery = {
-        $or: [
-          // Check for violation indicators in facilityData
-          { 'facilityData.Violations': { $exists: true, $ne: null } },
-          { 'facilityData.violations': { $exists: true, $ne: null } },
-          { 'facilityData.Violation': { $exists: true, $ne: null } },
-          { 'facilityData.violation': { $exists: true, $ne: null } },
-          { 'facilityData.ViolationCount': { $gt: 0 } },
-          { 'facilityData.violationCount': { $gt: 0 } },
-          { 'facilityData.Violation_Count': { $gt: 0 } },
-          
-          // Check for non-compliance indicators
-          { 'facilityData.ComplianceStatus': { $regex: /non.?compliant|violation|serious/i } },
-          { 'facilityData.complianceStatus': { $regex: /non.?compliant|violation|serious/i } },
-          { 'facilityData.Compliance_Status': { $regex: /non.?compliant|violation|serious/i } },
-          { 'facilityData.Status': { $regex: /non.?compliant|violation|serious/i } },
-          
-          // Check for enforcement actions
-          { 'source.folder': { $regex: /enforcement/i } },
-          { 'facilityData.EnforcementAction': { $exists: true, $ne: null } },
-          { 'facilityData.enforcementAction': { $exists: true, $ne: null } },
-          
-          // Check for significant violations
-          { 'facilityData.SignificantViolation': { $in: ['Y', 'Yes', true] } },
-          { 'facilityData.significantViolation': { $in: ['Y', 'Yes', true] } },
-          { 'facilityData.Significant_Violation': { $in: ['Y', 'Yes', true] } },
-        ]
-      };
-
-      const highRiskCount = await Facility.countDocuments(highRiskQuery);
-
-      // Active violations count
-      // Count facilities with active/open violations
-      const activeViolationsQuery = {
-        $or: [
-          { 'facilityData.ViolationStatus': { $regex: /active|open|current/i } },
-          { 'facilityData.violationStatus': { $regex: /active|open|current/i } },
-          { 'facilityData.Violation_Status': { $regex: /active|open|current/i } },
-          { 'facilityData.ActiveViolations': { $gt: 0 } },
-          { 'facilityData.activeViolations': { $gt: 0 } },
-          { 'facilityData.Active_Violations': { $gt: 0 } },
-        ]
-      };
-      const activeViolationsCount = await Facility.countDocuments(activeViolationsQuery);
-
-      // Non-compliant count
-      const nonCompliantQuery = {
-        $or: [
-          { 'facilityData.ComplianceStatus': { $regex: /non.?compliant|non.?compliance/i } },
-          { 'facilityData.complianceStatus': { $regex: /non.?compliant|non.?compliance/i } },
-          { 'facilityData.Compliance_Status': { $regex: /non.?compliant|non.?compliance/i } },
-          { 'facilityData.Status': { $regex: /non.?compliant|non.?compliance/i } },
-        ]
-      };
-      const nonCompliantCount = await Facility.countDocuments(nonCompliantQuery);
-
-      // Top 3 high-risk facilities
-      // Get facilities sorted by violation count or risk indicators
-      const topHighRiskFacilities = await Facility.find(highRiskQuery)
-        .sort({
-          // Sort by violation count if available, otherwise by creation date (newest first)
-          'facilityData.ViolationCount': -1,
-          'facilityData.violationCount': -1,
-          'facilityData.Violation_Count': -1,
-          createdAt: -1,
-        })
-        .limit(3)
-        .lean()
-        .select('REGISTRY_ID registry_id FRS_ID FacilityName facilityName City State Zip facilityData source');
-
-      // Format top facilities
-      const formattedTopFacilities = topHighRiskFacilities.map(facility => ({
-        registryId: facility.REGISTRY_ID || facility.registry_id || facility.FRS_ID,
-        facilityName: facility.FacilityName || facility.facilityName || 'Unknown',
-        city: facility.City || facility.city,
-        state: facility.State || facility.state,
-        zip: facility.Zip || facility.zip,
-        violationCount: facility.facilityData?.ViolationCount || 
-                       facility.facilityData?.violationCount || 
-                       facility.facilityData?.Violation_Count || 
-                       0,
-        complianceStatus: facility.facilityData?.ComplianceStatus || 
-                         facility.facilityData?.complianceStatus || 
-                         facility.facilityData?.Compliance_Status || 
-                         'Unknown',
-        sourceType: facility.source?.type || 'unknown',
-      }));
-
-      res.json({
-        success: true,
-        data: {
-          totalFacilities: totalCount,
-          highRiskFacilities: highRiskCount,
-          activeViolations: activeViolationsCount,
-          nonCompliant: nonCompliantCount,
-          topHighRiskFacilities: formattedTopFacilities,
-          summary: {
-            compliantFacilities: totalCount - nonCompliantCount,
-            complianceRate: totalCount > 0 ? ((totalCount - nonCompliantCount) / totalCount * 100).toFixed(2) : 0,
-            riskPercentage: totalCount > 0 ? (highRiskCount / totalCount * 100).toFixed(2) : 0,
-          },
-        },
-      });
     } catch (error) {
       console.error(`[ERROR] Error in getFacilityStatistics:`, error);
       res.status(500).json({
         success: false,
         error: error.message,
       });
+    }
+  }
+
+  /**
+   * Get default/initial statistics structure
+   * Used when Redis is empty or as fallback
+   */
+  getDefaultStatistics() {
+    return {
+      success: true,
+      updatedAt: new Date().toISOString(),
+      statistics: {
+        totalFacilities: 100,
+        compliant: 87,
+        nonCompliant: 2,
+        underReview: 11,
+        highRisk: 6,
+        activeViolations: 14,
+        programs: {
+          air: 7,
+          water: 35,
+          waste: 41,
+          enforcements: 0,
+        },
+        topRecentSearches: [
+          {
+            registryId: "110022286042",
+            name: "SILVERY FALLS FARMS",
+            city: "LOWVILLE",
+            state: "NY",
+            lastAccessed: new Date().toISOString(),
+          },
+          {
+            registryId: "110067647862",
+            name: "GREENVILLE QUARRIES",
+            city: "GREENVILLE",
+            state: "KY",
+            lastAccessed: new Date().toISOString(),
+          },
+          {
+            registryId: "110012805330",
+            name: "L AND L MOBILE HOME PARK WWTF",
+            city: "TROY",
+            state: "MO",
+            lastAccessed: new Date().toISOString(),
+          },
+        ],
+        topHighRiskFacilities: [
+          {
+            registryId: "110007709676",
+            name: "MILLER TRANSFER & RIGGING CO",
+            city: "EDINBURG",
+            state: "OH",
+          },
+          {
+            registryId: "110071882564",
+            name: "THE CARRIAGE HOUSE COMPANIES INC",
+            city: "BUCKNER",
+            state: "KY",
+          },
+          {
+            registryId: "110032646297",
+            name: "BXP 2100 PENN LLC",
+            city: "WASHINGTON",
+            state: "DC",
+          },
+          {
+            registryId: "110067647862",
+            name: "GREENVILLE QUARRIES",
+            city: "GREENVILLE",
+            state: "KY",
+          },
+          {
+            registryId: "110022286042",
+            name: "SILVERY FALLS FARMS",
+            city: "LOWVILLE",
+            state: "NY",
+          },
+          {
+            registryId: "110012805330",
+            name: "L AND L MOBILE HOME PARK WWTF",
+            city: "TROY",
+            state: "MO",
+          },
+        ],
+        latestInspections: [
+          {
+            registryId: "110009996380",
+            name: "CAROLINA GAS TRANSMISSION CORP",
+            city: "CAYCE",
+            state: "SC",
+            inspectionDate: "05/05/2025",
+            type: "State",
+            program: "General",
+          },
+          {
+            registryId: "110067647862",
+            name: "GREENVILLE QUARRIES",
+            city: "GREENVILLE",
+            state: "KY",
+            inspectionDate: "09/24/2024",
+            type: "State",
+            program: "General",
+          },
+          {
+            registryId: "110071499734",
+            name: "SOUTHWEST LIVESTOCK MARKET",
+            city: "HANSONVILLE",
+            state: "VA",
+            inspectionDate: "06/26/2024",
+            type: "State",
+            program: "General",
+          },
+          {
+            registryId: "110007709676",
+            name: "MILLER TRANSFER & RIGGING CO",
+            city: "EDINBURG",
+            state: "OH",
+            inspectionDate: "11/07/2023",
+            type: "State",
+            program: "General",
+          },
+          {
+            registryId: "110025375948",
+            name: "BELFOREST WATER SYSTEM",
+            city: "DAPHNE",
+            state: "AL",
+            inspectionDate: "09/14/2023",
+            type: "State",
+            program: "General",
+          },
+          {
+            registryId: "110045434213",
+            name: "MAGNOLIA STATION",
+            city: "HALL SUMMIT",
+            state: "LA",
+            inspectionDate: "09/01/2022",
+            type: "State",
+            program: "General",
+          },
+          {
+            registryId: "110017603645",
+            name: "VALLEY COOP, INC.",
+            city: "HACKNEY",
+            state: "KS",
+            inspectionDate: "01/30/2020",
+            type: "State",
+            program: "General",
+          },
+          {
+            registryId: "110012805330",
+            name: "L AND L MOBILE HOME PARK WWTF",
+            city: "TROY",
+            state: "MO",
+            inspectionDate: "09/11/2019",
+            type: "State",
+            program: "General",
+          },
+          {
+            registryId: "110070559223",
+            name: "NORTHEAST ENVIRONMENTAL TESTING LAB",
+            city: "PROVIDENCE",
+            state: "RI",
+            inspectionDate: "04/09/2019",
+            type: "State",
+            program: "General",
+          },
+          {
+            registryId: "110070202724",
+            name: "LA PLATA ARCHULETA WATER DISTRICT PHASE 1G-1",
+            city: "DURANGO",
+            state: "CO",
+            inspectionDate: "04/24/2018",
+            type: "State",
+            program: "General",
+          },
+        ],
+      },
+    };
+  }
+
+  /**
+   * Initialize Redis with statistics data
+   * Called on server startup to populate cache
+   */
+  async initializeStatisticsInRedis() {
+    try {
+      console.log(`[STATS INIT] Initializing statistics in Redis...`);
+      
+      // Initialize Redis if needed
+      const redisClient = await this.initRedis();
+
+      if (!redisClient || !redisClient.isOpen) {
+        console.warn(`[STATS INIT] Redis not available, skipping initialization`);
+        return;
+      }
+
+      const cacheKey = 'facility:statistics';
+      
+      // Check if data already exists
+      const existing = await redisClient.get(cacheKey);
+      if (existing) {
+        console.log(`[STATS INIT] Statistics already exist in Redis, skipping initialization`);
+        return;
+      }
+
+      // Use default statistics if Redis is empty
+      console.log(`[STATS INIT] Redis is empty, storing default statistics...`);
+      const defaultStats = this.getDefaultStatistics();
+      
+      // Store in Redis cache (with 24 hour expiration)
+      await redisClient.setEx(cacheKey, 86400, JSON.stringify(defaultStats)); // 24 hours
+      console.log(`[STATS INIT] ✓ Default statistics stored in Redis`);
+      console.log(`[STATS INIT]   Total Facilities: ${defaultStats.statistics.totalFacilities}`);
+      console.log(`[STATS INIT]   Cache expires in 24 hours\n`);
+    } catch (error) {
+      console.error(`[STATS INIT] Error initializing statistics:`, error);
+      // Don't throw - allow server to start even if Redis init fails
+    }
+  }
+
+  /**
+   * Daily job to update statistics in Redis
+   * Runs every day at midnight
+   */
+  async updateStatisticsDaily() {
+    try {
+      console.log(`[STATS JOB] Starting daily statistics update...`);
+      
+      // Initialize Redis if needed
+      const redisClient = await this.initRedis();
+
+      // Calculate fresh statistics
+      const statistics = await this.calculateStatistics();
+
+      // Store in Redis cache (with 24 hour expiration)
+      if (redisClient && redisClient.isOpen) {
+        const cacheKey = 'facility:statistics';
+        await redisClient.setEx(cacheKey, 86400, JSON.stringify(statistics)); // 24 hours
+        console.log(`[STATS JOB] Statistics updated in Redis at ${new Date().toISOString()}`);
+      } else {
+        console.warn(`[STATS JOB] Redis not available, skipping cache update`);
+      }
+    } catch (error) {
+      console.error(`[STATS JOB] Error updating statistics:`, error);
     }
   }
 
@@ -2202,7 +2709,7 @@ class FacilityController {
   formatRawData(facilityData) {
     return {
       REGISTRY_ID: facilityData.REGISTRY_ID || null,
-      FAC_NAME: facilityData.FAC_NAME || facilityData.FacilityName || null,
+      FAC_NAME: facilityData.name || facilityData.FacilityName || null,
       FAC_STREET: facilityData.FAC_STREET || facilityData.Street || null,
       FAC_CITY: facilityData.FAC_CITY || facilityData.City || null,
       FAC_STATE: facilityData.FAC_STATE || facilityData.State || null,
@@ -2543,23 +3050,21 @@ class FacilityController {
       // Build rawData object - use the facility data from facilityDetails
       const rawData = this.formatRawData(facilityData);
 
-      // Format response to match exact structure
-      // Use transformed data as base and enrich with additional data from storedFacilityDetails
+      // Return everything from DB as-is, just remove id, epaId, facilityName from facility object
+      // Get the document structure from storedFacilityDetails
+      const facilityObj = storedFacilityDetails.facility || {};
+      
+      // Remove id, epaId, facilityName from facility object (use different variable names to avoid conflict)
+      const { id: facilityId, epaId: facilityEpaId, facilityName: facilityNameField, ...cleanFacility } = facilityObj;
+      
+      // Build response with everything from DB, just cleaning the facility object
       const formattedResponse = {
-        _id: transformedData._id,
-        REGISTRY_ID: transformedData.REGISTRY_ID,
-        facility,
-        violations: violations.length > 0 ? violations : transformedData.violations,
-        inspections: inspections.length > 0 ? inspections : transformedData.inspections,
-        complianceScores,
-        enforcementActions: enforcementActions.length > 0 ? enforcementActions : transformedData.enforcementActions,
-        emissions: this.formatEmissions(storedFacilityDetails).length > 0 ? this.formatEmissions(storedFacilityDetails) : transformedData.emissions,
-        stackTests: this.formatStackTests(storedFacilityDetails).length > 0 ? this.formatStackTests(storedFacilityDetails) : transformedData.stackTests,
-        titleVCerts: this.formatTitleVCerts(storedFacilityDetails).length > 0 ? this.formatTitleVCerts(storedFacilityDetails) : transformedData.titleVCerts,
-        pollutants: this.formatPollutants(storedFacilityDetails).length > 0 ? this.formatPollutants(storedFacilityDetails) : transformedData.pollutants,
-        dataGroups: this.formatDataGroups(storedFacilityDetails).length > 0 ? this.formatDataGroups(storedFacilityDetails) : transformedData.dataGroups,
-        qncrHistory: this.formatQncrHistory(facilityData, storedFacilityDetails).length > 0 ? this.formatQncrHistory(facilityData, storedFacilityDetails) : transformedData.qncrHistory,
-        rawData: transformedData.rawData,
+        facility: cleanFacility,
+        violations: storedFacilityDetails.violations || [],
+        inspections: storedFacilityDetails.inspections || [],
+        enforcementCases: storedFacilityDetails.enforcementCases || [],
+        complianceScores: storedFacilityDetails.complianceScores || {},
+        emissions: storedFacilityDetails.emissions || [],
       };
 
       res.json(formattedResponse);

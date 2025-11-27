@@ -1,5 +1,7 @@
 const express = require('express');
 const facilitiesRoutes = require('./routes/facilities');
+const cron = require('node-cron');
+const facilityController = require('./controllers/facilityController');
 require('dotenv').config();
 
 const app = express();
@@ -75,6 +77,29 @@ app.get('/', (req, res) => {
     },
   });
 });
+
+// Initialize Redis connection (optional - app works without it)
+const { connectRedis } = require('./config/redis');
+connectRedis().then(async () => {
+  // Initialize statistics in Redis on startup
+  await facilityController.initializeStatisticsInRedis();
+}).catch(err => {
+  // Error already logged in connectRedis, just continue
+  console.warn(`[STARTUP] Skipping Redis initialization due to connection error`);
+});
+
+// Schedule daily statistics update (runs at midnight every day)
+// Cron format: minute hour day month day-of-week
+// '0 0 * * *' = every day at 00:00 (midnight)
+cron.schedule('0 0 * * *', async () => {
+  console.log(`[CRON] Running daily statistics update job...`);
+  await facilityController.updateStatisticsDaily();
+}, {
+  scheduled: true,
+  timezone: 'America/New_York', // Adjust timezone as needed
+});
+
+console.log(`[CRON] Daily statistics update job scheduled (runs at midnight daily)`);
 
 // Start server
 const server = app.listen(PORT, '0.0.0.0', () => {
