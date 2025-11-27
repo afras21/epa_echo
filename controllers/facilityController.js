@@ -906,60 +906,14 @@ class FacilityController {
 
   /**
    * Get facility statistics and analytics
-   * Returns: total count, high-risk count, active violations, non-compliant count, top high-risk facilities, latest inspections
-   * Supports Redis caching and live=true parameter for fresh calculation
+   * Returns: default statistics data (always returns getDefaultStatistics)
    */
   async getFacilityStatistics(req, res) {
     try {
-      const { live } = req.query;
-      const isLive = live === 'true' || live === true;
-      const cacheKey = 'facility:statistics';
-
-      // Initialize Redis if not already connected
-      const redisClient = await this.initRedis();
-
-      // If not live, try to get from Redis cache
-      if (!isLive && redisClient && redisClient.isOpen) {
-        try {
-          const cachedStats = await redisClient.get(cacheKey);
-          if (cachedStats) {
-            console.log(`[STATS] Returning cached statistics from Redis`);
-            const parsedStats = JSON.parse(cachedStats);
-            return res.json(parsedStats);
-          } else {
-            // Redis is empty, store default statistics and return
-            console.log(`[STATS] Redis is empty, storing default statistics...`);
-            const defaultStats = this.getDefaultStatistics();
-            
-            // Store in Redis cache (with 24 hour expiration)
-            await redisClient.setEx(cacheKey, 86400, JSON.stringify(defaultStats)); // 24 hours
-            console.log(`[STATS] Default statistics stored in Redis`);
-            
-            return res.json(defaultStats);
-          }
-        } catch (redisError) {
-          console.warn(`[STATS] Redis cache read error:`, redisError.message);
-          // Continue to calculate fresh statistics
-        }
-      }
-
-      // Calculate fresh statistics (only if live=true or Redis unavailable)
-      console.log(`[STATS] Calculating fresh statistics${isLive ? ' (live=true)' : ''}...`);
-      const statistics = await this.calculateStatistics();
-
-      // Store in Redis cache (with 24 hour expiration)
-      if (redisClient && redisClient.isOpen) {
-        try {
-          await redisClient.setEx(cacheKey, 86400, JSON.stringify(statistics)); // 24 hours = 86400 seconds
-          console.log(`[STATS] Statistics cached in Redis for 24 hours`);
-        } catch (redisError) {
-          console.warn(`[STATS] Redis cache write error:`, redisError.message);
-          // Continue even if Redis write fails
-        }
-      }
-
-      res.json(statistics);
-
+      // Always return default statistics
+      const defaultStats = this.getDefaultStatistics();
+      console.log(`[STATS] Returning default statistics`);
+      res.json(defaultStats);
     } catch (error) {
       console.error(`[ERROR] Error in getFacilityStatistics:`, error);
       res.status(500).json({
