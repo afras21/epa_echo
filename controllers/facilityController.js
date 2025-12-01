@@ -231,7 +231,8 @@ class FacilityController {
   }
 
   /**
-   * Get native MongoDB collections for related data (violations, inspections, emissions, enforcements)
+   * Get native MongoDB collections for related data
+   * (facilities, violations, inspections, emissions, enforcements, enforcementSummary)
    * We use the underlying connection.db to support the new separated collections design.
    */
   async getCollections() {
@@ -244,6 +245,7 @@ class FacilityController {
       inspections: db.collection('inspections'),
       emissions: db.collection('emissions'),
       enforcements: db.collection('enforcements'),
+      enforcementSummary: db.collection('enforcementSummary'),
     };
   }
 
@@ -1127,136 +1129,48 @@ class FacilityController {
   }
 
   /**
-   * Get mock enforcement analytics report
-   * Returns structured enforcement metrics by media, region, and industry.
+   * Get enforcement analytics report from precomputed summary data.
+   * Reads directly from the enforcementSummary collection and returns documents as-is,
+   * optionally filtered by year.
    */
   async getEnforcementReport(req, res) {
     try {
-      const EPA_REGIONS = {
-        'Region 1': 'New England',
-        'Region 2': 'New York/New Jersey',
-        'Region 3': 'Mid-Atlantic',
-        'Region 4': 'Southeast',
-        'Region 5': 'Great Lakes',
-        'Region 6': 'South Central',
-        'Region 7': 'Midwest',
-        'Region 8': 'Mountains & Plains',
-        'Region 9': 'Pacific Southwest',
-        'Region 10': 'Pacific Northwest',
-      };
+      const { year } = req.query;
 
-      const mockAnalytics = [
-        {
-          media: 'CWA',
-          region: 'Region 5',
-          industry: 'Manufacturing',
-          cases: 120,
-          totalPenalties: 4500000,
-          avgPenalty: 37500,
-          trend: 'up',
-          notes: 'Significant NPDES effluent violations, stormwater permit issues',
-        },
-        {
-          media: 'RCRA',
-          region: 'Region 6',
-          industry: 'Chemical Manufacturing',
-          cases: 80,
-          totalPenalties: 6200000,
-          avgPenalty: 77500,
-          trend: 'up',
-          notes: 'Generator and storage violations, hazardous waste manifest issues',
-        },
-        {
-          media: 'CAA',
-          region: 'Region 3',
-          industry: 'Vehicle/Engine Manufacturing',
-          cases: 50,
-          totalPenalties: 2800000,
-          avgPenalty: 56000,
-          trend: 'stable',
-          notes: 'Title V permit violations, NSR issues, emission reporting',
-        },
-        {
-          media: 'SDWA',
-          region: 'Region 2',
-          industry: 'Water Utilities',
-          cases: 35,
-          totalPenalties: 1200000,
-          avgPenalty: 34286,
-          trend: 'down',
-          notes: 'MCL exceedances, reporting deficiencies, monitoring failures',
-        },
-        {
-          media: 'CAA',
-          region: 'Region 9',
-          industry: 'Oil & Gas Extraction',
-          cases: 45,
-          totalPenalties: 3100000,
-          avgPenalty: 68889,
-          trend: 'up',
-          notes: 'Flaring violations, fugitive emissions, leak detection issues',
-        },
-        {
-          media: 'CWA',
-          region: 'Region 4',
-          industry: 'Food Manufacturing',
-          cases: 65,
-          totalPenalties: 1800000,
-          avgPenalty: 27692,
-          trend: 'stable',
-          notes: 'BOD/TSS exceedances, pretreatment program violations',
-        },
-        {
-          media: 'RCRA',
-          region: 'Region 1',
-          industry: 'Electronics Manufacturing',
-          cases: 28,
-          totalPenalties: 1500000,
-          avgPenalty: 53571,
-          trend: 'down',
-          notes: 'E-waste management, universal waste handling',
-        },
-        {
-          media: 'CAA',
-          region: 'Region 7',
-          industry: 'Agriculture & Livestock',
-          cases: 22,
-          totalPenalties: 850000,
-          avgPenalty: 38636,
-          trend: 'up',
-          notes: 'Ammonia emissions, CAFO air quality issues',
-        },
-        {
-          media: 'CWA',
-          region: 'Region 10',
-          industry: 'Mining',
-          cases: 38,
-          totalPenalties: 5200000,
-          avgPenalty: 136842,
-          trend: 'up',
-          notes: 'Acid mine drainage, sediment control, water quality impacts',
-        },
-        {
-          media: 'RCRA',
-          region: 'Region 8',
-          industry: 'Vehicle Maintenance',
-          cases: 42,
-          totalPenalties: 980000,
-          avgPenalty: 23333,
-          trend: 'stable',
-          notes: 'Used oil management, hazardous waste determination',
-        },
-      ];
+      // Get native collections
+      const collections = await this.getCollections();
+      const summaryCol = collections.enforcementSummary;
 
-      const data = mockAnalytics.map(item => ({
-        ...item,
-        regionName: EPA_REGIONS[item.region] || null,
-      }));
+      if (!summaryCol) {
+        return res.status(500).json({
+          success: false,
+          error: 'enforcementSummary collection not available in database.',
+        });
+      }
+
+      // Build optional year filter; support numeric or string year in DB
+      const filter = {};
+      if (year) {
+        const yearNum = parseInt(year, 10);
+        if (!Number.isNaN(yearNum)) {
+          filter.$or = [
+            { year: yearNum },
+            { year: year.toString() },
+          ];
+        } else {
+          filter.year = year.toString();
+        }
+      }
+
+      const docs = await summaryCol
+        .find(filter)
+        .sort({ year: -1 })
+        .toArray();
 
       return res.json({
         success: true,
         updatedAt: new Date().toISOString(),
-        data,
+        data: docs,
       });
     } catch (error) {
       console.error('[ERROR] Error in getEnforcementReport:', error);

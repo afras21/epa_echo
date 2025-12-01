@@ -81,12 +81,228 @@ GET /api/facilities?state=CA&city=Los Angeles&limit=50&nextToken=...
 - `pagination.total` - Total number of facilities matching filters
 - `pagination.hasMore` - Boolean indicating if more results available
 
+Each facility item in the list view includes (subset):
+
+- `_id`: Registry ID (FRS ID)
+- `name`: Facility name
+- `address`, `street`, `city`, `state`, `zip`, `county`, `region`
+- `industryGroup`
+- `lat`, `long`
+- `programs`: Array of program codes/descriptions (e.g., CAA, CWA/NPDES, RCRA)
+- `complianceStatus`
+- `riskScoreOverall`
+- `violationsCount`
+- `lastInspectionDate`
+
 ### Get Facility by ID
 ```
 GET /api/facilities/:id
 ```
 
 Returns a specific facility by FRS ID or facility name.
+
+### Get Comprehensive Facility Details
+```
+GET /api/facilities/:id/details
+```
+
+Returns a comprehensive detail object for a facility, joined from multiple collections:
+
+- `facility`: Flattened facility summary (matching the `facilities` collection shape)
+- `violations`: All related violations for the facility
+- `inspections`: All related inspections
+- `enforcementCases`: All related enforcement cases
+- `complianceScores`: Precomputed or recalculated compliance scores
+- `emissions`: Emissions records (if present)
+
+Example facility summary document (from `facilities` collection):
+
+```json
+{
+  "_id": "110070466233",
+  "REGISTRY_ID": "110070466233",
+  "id": "110070466233",
+  "name": "ACME CHEMICAL PLANT",
+  "facilityName": "ACME CHEMICAL PLANT",
+  "address": "123 INDUSTRIAL WAY",
+  "street": "123 INDUSTRIAL WAY",
+  "city": "RIVER TOWN",
+  "state": "TX",
+  "zip": "75001",
+  "county": "DALLAS",
+  "region": "06",
+  "industryGroup": "Chemical Manufacturing",
+  "latitude": 32.9567,
+  "longitude": -96.8353,
+  "naicsCode": "325199",
+  "sicCode": "2819",
+  "programs": [
+    { "code": "NPDES", "programDesc": "National Pollutant Discharge Elimination System" },
+    { "code": "CAA", "programDesc": "Clean Air Act" },
+    { "code": "RCRA", "programDesc": "Resource Conservation and Recovery Act" }
+  ],
+  "complianceStatus": "In Violation",
+  "lastInspection": "2024-07-15",
+  "lastInspectionType": "EPA",
+  "inspectionDates": {
+    "epa": "2024-07-15",
+    "state": "2023-11-02",
+    "mostRecent": { "date": "2024-07-15", "type": "EPA" }
+  },
+  "enforcementActions": {
+    "lastFormalActionEPA": "2023-12-20",
+    "lastFormalActionState": "2022-08-10",
+    "lastInformalActionEPA": "2023-05-01",
+    "lastInformalActionState": "2023-03-15"
+  },
+  "aggregatedData": {
+    "totalPenalties": 250000.0,
+    "formalActionCount": 3,
+    "informalCount": 5,
+    "inspectionCount": 12,
+    "quartersWithNC": 6
+  },
+  "riskScore": 4.2,
+  "complianceScores": {
+    "overall": 5.0,
+    "air": 6.5,
+    "water": 4.0,
+    "waste": 5.5
+  },
+  "violationCount": 18,
+  "inspectionCount": 12,
+  "emissionCount": 45,
+  "enforcementCaseCount": 2
+}
+```
+
+Related collections (examples):
+
+- **Violations**
+
+  ```json
+  {
+    "_id": "VIO-110070466233-001",
+    "facilityId": "110070466233",
+    "program": "NPDES",
+    "violationType": "Effluent Limit Exceedance",
+    "type": "Effluent Limit Exceedance",
+    "description": "Exceeded monthly average limit for BOD",
+    "date": "2024-06-01",
+    "severity": "Significant",
+    "status": "Open",
+    "penalty": 15000.0,
+    "resolved": false,
+    "finding": "Significant Non-Compliance (SNC)"
+  }
+  ```
+
+- **Inspections**
+
+  ```json
+  {
+    "_id": "INS-110070466233-001",
+    "facilityId": "110070466233",
+    "date": "2024-07-15",
+    "type": "Compliance Evaluation Inspection",
+    "program": "NPDES",
+    "findings": "In Violation",
+    "violations": 4,
+    "result": "In Violation",
+    "inspector": "EPA Region 6",
+    "summary": "Compliance Evaluation Inspection conducted. Compliance status: In Violation"
+  }
+  ```
+
+- **Emissions**
+
+  ```json
+  {
+    "_id": "EM-110070466233-001",
+    "facilityId": "110070466233",
+    "year": "2023",
+    "pollutant": "Nitrogen Oxides (NOx)",
+    "program": "TRI",
+    "quantityTons": 120.5,
+    "unit": "tons/year",
+    "stackId": "STK-1",
+    "processDescription": "Boiler #1"
+  }
+  ```
+
+- **Enforcement Cases**
+
+  ```json
+  {
+    "_id": "ENF-110070466233-12345",
+    "facilityId": "110070466233",
+    "case_number": "12345",
+    "case_name": "ACME CHEMICAL – NPDES Violations",
+    "status": "Closed",
+    "fiscal_year": "2024",
+    "penalties": {
+      "total": 200000.0,
+      "federal": 150000.0,
+      "stateLocal": 50000.0
+    },
+    "violations": [
+      "Effluent Limit Exceedance",
+      "Failure to Report DMRs"
+    ],
+    "milestones": [
+      { "type": "Complaint Filed", "date": "2023-09-01" },
+      { "type": "Consent Decree Lodged", "date": "2024-01-15" },
+      { "type": "Final Order", "date": "2024-03-30" }
+    ]
+  }
+  ```
+
+### Facility Statistics (Dashboard)
+```
+GET /api/facilities/statistics
+```
+
+Returns dashboard statistics JSON with:
+
+- Total facilities, compliant, non-compliant, under review, high-risk
+- Active violations
+- Program counts (`air`, `water`, `waste`, `enforcements`)
+- `topRecentSearches`, `topHighRiskFacilities`, `latestInspections`
+
+Currently this endpoint serves a default, precomputed statistics payload.
+
+### Enforcement Analytics Report
+```
+GET /api/facilities/enforcement-report
+```
+
+Returns enforcement analytics data from the `enforcementSummary` collection. Supports optional `year` filter:
+
+- `GET /api/facilities/enforcement-report` – all years
+- `GET /api/facilities/enforcement-report?year=2023` – only records for 2023
+
+Response format:
+
+```json
+{
+  "success": true,
+  "updatedAt": "2025-01-01T00:00:00.000Z",
+  "data": [
+    {
+      "_id": "...",
+      "year": 2023,
+      "media": "CAA",
+      "region": "Region 5",
+      "industry": "Manufacturing",
+      "cases": 120,
+      "totalPenalties": 4500000,
+      "avgPenalty": 37500,
+      "trend": "up",
+      "notes": "Precomputed enforcement summary data for this segment"
+    }
+  ]
+}
+```
 
 ## Usage Examples
 
