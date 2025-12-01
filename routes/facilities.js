@@ -43,6 +43,12 @@ router.get('/', (req, res) => facilityController.getAllFacilities(req, res));
 router.get('/statistics', (req, res) => facilityController.getFacilityStatistics(req, res));
 
 /**
+ * GET /api/facilities/enforcement-report
+ * Get mock enforcement analytics report (by media, region, industry)
+ */
+router.get('/enforcement-report', (req, res) => facilityController.getEnforcementReport(req, res));
+
+/**
  * GET /api/facilities/:id/details
  * Get comprehensive facility details by REGISTRY_ID
  * Combines all data from Water, Air, RCRA, Enforcement, Permits, FRS, Air Emissions

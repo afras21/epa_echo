@@ -231,11 +231,20 @@ class FacilityController {
   }
 
   /**
-   * Get FacilityDetails model from connection
+   * Get native MongoDB collections for related data (violations, inspections, emissions, enforcements)
+   * We use the underlying connection.db to support the new separated collections design.
    */
-  async getFacilityDetailsModel() {
+  async getCollections() {
     const conn = await this.getDumpConnection();
-    return conn.FacilityDetails;
+    const db = conn.db;
+
+    return {
+      facilities: db.collection('facilities'),
+      violations: db.collection('violations'),
+      inspections: db.collection('inspections'),
+      emissions: db.collection('emissions'),
+      enforcements: db.collection('enforcements'),
+    };
   }
 
   /**
@@ -347,10 +356,10 @@ class FacilityController {
 
       const limitNum = Math.min(parseInt(limit) || 25, 500); // Default 25, max 500 per page
 
-      // Get FacilityDetails model from dump database connection (has the nested facility structure)
-      let FacilityDetails;
+      // Get Facility model from dump database connection (facilities summary collection)
+      let Facility;
       try {
-        FacilityDetails = await this.getFacilityDetailsModel();
+        Facility = await this.getFacilityModel();
       } catch (error) {
         return res.status(500).json({
           success: false,
@@ -358,37 +367,15 @@ class FacilityController {
         });
       }
 
-      if (!FacilityDetails) {
+      if (!Facility) {
         return res.status(500).json({
           success: false,
-          error: 'FacilityDetails model not available. Please check your database connection.',
+          error: 'Facility model not available. Please check your database connection.',
         });
       }
 
-      // Build MongoDB query for facilityDetails collection
-      // For now, use empty query to get all facilities (filters can be added later)
-      const query = {};
-      
-      // Add basic filters if provided
-      if (filters.state) {
-        query['facility.state'] = { $regex: filters.state.toUpperCase(), $options: 'i' };
-      }
-      if (filters.city) {
-        query['facility.city'] = { $regex: filters.city, $options: 'i' };
-      }
-      if (filters.zip) {
-        query['facility.zip'] = filters.zip;
-      }
-      if (filters.frsId || filters.name) {
-        query.$or = [];
-        if (filters.frsId) {
-          query.$or.push({ REGISTRY_ID: { $regex: filters.frsId, $options: 'i' } });
-          query.$or.push({ 'facility.registryId': { $regex: filters.frsId, $options: 'i' } });
-        }
-        if (filters.name) {
-          query.$or.push({ 'facility.name': { $regex: filters.name, $options: 'i' } });
-        }
-      }
+      // Build MongoDB query for facilities collection (summary documents)
+      const query = this.buildQuery(filters);
 
       // Handle pagination with nextToken
       let skip = 0;
@@ -399,23 +386,41 @@ class FacilityController {
         }
       }
 
-      // Fetch facilities from MongoDB facilityDetails collection
-      const facilities = await FacilityDetails.find(query)
-        .sort({ updatedAt: -1, lastFetched: -1, createdAt: -1 })
+      // Fetch facilities from MongoDB facilities collection
+      const facilities = await Facility.find(query)
+        .sort({ updatedAt: -1, createdAt: -1 })
         .skip(skip)
         .limit(limitNum + 1) // Fetch one extra to check if there's more
         .lean();
       
-      console.log(`[DEBUG] getAllFacilities - Found ${facilities.length} facilities from facilityDetails collection`);
+      console.log(`[DEBUG] getAllFacilities - Found ${facilities.length} facilities from facilities collection`);
 
       // Transform facilities to return only requested fields for list view
       const transformedFacilities = facilities.map(doc => {
-        // Get facility object from document
-        const facilityObj = doc.facility || {};
-        
-        // Remove id, epaId, facilityName from facility object
-        const { id, epaId, facilityName, ...cleanFacility } = facilityObj;
-        
+        // Support both the new flattened summary shape and older raw shapes
+        const cleanFacility = {
+          name: doc.name || doc.facilityName || doc.FacilityName || doc.FAC_NAME || '',
+          address: doc.address || doc.street || doc.FAC_STREET || '',
+          street: doc.street || doc.FAC_STREET || '',
+          city: doc.city || doc.City || doc.FAC_CITY || '',
+          state: doc.state || doc.State || doc.FAC_STATE || '',
+          zip: doc.zip || doc.Zip || doc.FAC_ZIP || '',
+          county: doc.county || doc.County || doc.FAC_COUNTY || '',
+          region: doc.region || doc.Region || '',
+          industryGroup: doc.industryGroup || doc.industry || doc.industry_group || '',
+          latitude: doc.latitude || doc.Latitude || doc.FAC_LAT || null,
+          longitude: doc.longitude || doc.Longitude || doc.FAC_LONG || null,
+          programs: doc.programs || [],
+          complianceStatus: doc.complianceStatus || doc.fac_compliance_status || '',
+          riskScore: doc.riskScore || (doc.complianceScores && doc.complianceScores.overall) || null,
+          lastInspection: doc.lastInspection ||
+            (doc.inspectionDates && doc.inspectionDates.mostRecent && doc.inspectionDates.mostRecent.date) ||
+            (doc.inspectionDates && doc.inspectionDates.epa) ||
+            (doc.inspectionDates && doc.inspectionDates.state) ||
+            null,
+          violationCount: doc.violationCount || 0,
+        };
+
         // Return only requested fields for list view
         return {
           _id: doc._id || doc.REGISTRY_ID || null,
@@ -427,18 +432,14 @@ class FacilityController {
           zip: cleanFacility.zip || '',
           county: cleanFacility.county || '',
           region: cleanFacility.region || '',
-          industryGroup: cleanFacility.industryGroup || cleanFacility.industry || '',
+          industryGroup: cleanFacility.industryGroup || '',
           lat: cleanFacility.latitude || null,
           long: cleanFacility.longitude || null,
           programs: cleanFacility.programs || [],
           complianceStatus: cleanFacility.complianceStatus || '',
-          riskScoreOverall: cleanFacility.riskScore || cleanFacility.riskScoreOverall || null,
-          violationsCount: doc.violations ? doc.violations.length : 0,
-          lastInspectionDate: cleanFacility.lastInspection || 
-            (cleanFacility.inspectionDates?.mostRecent?.date) || 
-            (cleanFacility.inspectionDates?.epa) || 
-            (cleanFacility.inspectionDates?.state) || 
-            null,
+          riskScoreOverall: cleanFacility.riskScore,
+          violationsCount: cleanFacility.violationCount,
+          lastInspectionDate: cleanFacility.lastInspection,
         };
       });
 
@@ -449,7 +450,7 @@ class FacilityController {
       // Get total count (only if no filters or for first page)
       let total = null;
       if (skip === 0 && Object.keys(filters).length === 0) {
-        total = await FacilityDetails.countDocuments(query);
+        total = await Facility.countDocuments(query);
       }
 
       // Generate next token
@@ -1123,6 +1124,147 @@ class FacilityController {
         ],
       },
     };
+  }
+
+  /**
+   * Get mock enforcement analytics report
+   * Returns structured enforcement metrics by media, region, and industry.
+   */
+  async getEnforcementReport(req, res) {
+    try {
+      const EPA_REGIONS = {
+        'Region 1': 'New England',
+        'Region 2': 'New York/New Jersey',
+        'Region 3': 'Mid-Atlantic',
+        'Region 4': 'Southeast',
+        'Region 5': 'Great Lakes',
+        'Region 6': 'South Central',
+        'Region 7': 'Midwest',
+        'Region 8': 'Mountains & Plains',
+        'Region 9': 'Pacific Southwest',
+        'Region 10': 'Pacific Northwest',
+      };
+
+      const mockAnalytics = [
+        {
+          media: 'CWA',
+          region: 'Region 5',
+          industry: 'Manufacturing',
+          cases: 120,
+          totalPenalties: 4500000,
+          avgPenalty: 37500,
+          trend: 'up',
+          notes: 'Significant NPDES effluent violations, stormwater permit issues',
+        },
+        {
+          media: 'RCRA',
+          region: 'Region 6',
+          industry: 'Chemical Manufacturing',
+          cases: 80,
+          totalPenalties: 6200000,
+          avgPenalty: 77500,
+          trend: 'up',
+          notes: 'Generator and storage violations, hazardous waste manifest issues',
+        },
+        {
+          media: 'CAA',
+          region: 'Region 3',
+          industry: 'Vehicle/Engine Manufacturing',
+          cases: 50,
+          totalPenalties: 2800000,
+          avgPenalty: 56000,
+          trend: 'stable',
+          notes: 'Title V permit violations, NSR issues, emission reporting',
+        },
+        {
+          media: 'SDWA',
+          region: 'Region 2',
+          industry: 'Water Utilities',
+          cases: 35,
+          totalPenalties: 1200000,
+          avgPenalty: 34286,
+          trend: 'down',
+          notes: 'MCL exceedances, reporting deficiencies, monitoring failures',
+        },
+        {
+          media: 'CAA',
+          region: 'Region 9',
+          industry: 'Oil & Gas Extraction',
+          cases: 45,
+          totalPenalties: 3100000,
+          avgPenalty: 68889,
+          trend: 'up',
+          notes: 'Flaring violations, fugitive emissions, leak detection issues',
+        },
+        {
+          media: 'CWA',
+          region: 'Region 4',
+          industry: 'Food Manufacturing',
+          cases: 65,
+          totalPenalties: 1800000,
+          avgPenalty: 27692,
+          trend: 'stable',
+          notes: 'BOD/TSS exceedances, pretreatment program violations',
+        },
+        {
+          media: 'RCRA',
+          region: 'Region 1',
+          industry: 'Electronics Manufacturing',
+          cases: 28,
+          totalPenalties: 1500000,
+          avgPenalty: 53571,
+          trend: 'down',
+          notes: 'E-waste management, universal waste handling',
+        },
+        {
+          media: 'CAA',
+          region: 'Region 7',
+          industry: 'Agriculture & Livestock',
+          cases: 22,
+          totalPenalties: 850000,
+          avgPenalty: 38636,
+          trend: 'up',
+          notes: 'Ammonia emissions, CAFO air quality issues',
+        },
+        {
+          media: 'CWA',
+          region: 'Region 10',
+          industry: 'Mining',
+          cases: 38,
+          totalPenalties: 5200000,
+          avgPenalty: 136842,
+          trend: 'up',
+          notes: 'Acid mine drainage, sediment control, water quality impacts',
+        },
+        {
+          media: 'RCRA',
+          region: 'Region 8',
+          industry: 'Vehicle Maintenance',
+          cases: 42,
+          totalPenalties: 980000,
+          avgPenalty: 23333,
+          trend: 'stable',
+          notes: 'Used oil management, hazardous waste determination',
+        },
+      ];
+
+      const data = mockAnalytics.map(item => ({
+        ...item,
+        regionName: EPA_REGIONS[item.region] || null,
+      }));
+
+      return res.json({
+        success: true,
+        updatedAt: new Date().toISOString(),
+        data,
+      });
+    } catch (error) {
+      console.error('[ERROR] Error in getEnforcementReport:', error);
+      return res.status(500).json({
+        success: false,
+        error: error.message,
+      });
+    }
   }
 
   /**
@@ -2777,32 +2919,12 @@ class FacilityController {
       const { id } = req.params; // REGISTRY_ID
       const cleanId = id.trim();
       console.log(`[DEBUG] Getting comprehensive details for REGISTRY_ID: ${cleanId}`);
-
-      // Get FacilityDetails model and verify connection
-      let FacilityDetails;
-      let conn;
+      // Get Facility model (summary) and related collections (violations, inspections, emissions, enforcements)
+      let Facility;
+      let collections;
       try {
-        conn = await this.getDumpConnection();
-        FacilityDetails = await this.getFacilityDetailsModel();
-        
-        if (!FacilityDetails) {
-          return res.status(500).json({
-            success: false,
-            error: 'FacilityDetails model not available on connection',
-          });
-        }
-        
-        // Verify connection is active
-        if (conn.readyState !== 1) {
-          return res.status(500).json({
-            success: false,
-            error: `Database connection not ready. State: ${conn.readyState}`,
-          });
-        }
-        
-        // Test query to verify we can access the database
-        const testCount = await FacilityDetails.countDocuments({}).limit(1);
-        console.log(`[DEBUG] Database connection verified. Collection: ${FacilityDetails.collection.name}, Database: ${conn.db.databaseName}`);
+        Facility = await this.getFacilityModel();
+        collections = await this.getCollections();
       } catch (error) {
         console.error(`[ERROR] Database connection/query error:`, error);
         return res.status(500).json({
@@ -2811,238 +2933,64 @@ class FacilityController {
         });
       }
 
-      // Fetch facility details from facilityDetails collection
-      // Try as both string and number since database might store it either way
-      const searchQueries = [];
-      
-      // Always try as string first
-      searchQueries.push({ REGISTRY_ID: cleanId });
-      searchQueries.push({ REGISTRY_ID: cleanId.toString() });
-      
-      // If ID is numeric, also try as number (database might store as Number type)
-      if (!isNaN(cleanId)) {
-        const numId = parseInt(cleanId);
-        const numIdStr = String(numId);
-        searchQueries.push(
-          { REGISTRY_ID: numId },
-          { REGISTRY_ID: numIdStr },
-        );
+      if (!Facility || !collections) {
+        return res.status(500).json({
+          success: false,
+          error: 'Required database models/collections are not available.',
+        });
       }
 
-      console.log(`[DEBUG] Searching facilityDetails collection for REGISTRY_ID: ${cleanId}`);
+      // Fetch facility summary from facilities collection
+      // IMPORTANT: do NOT query by _id here to avoid ObjectId cast errors for non-ObjectId strings.
+      const searchQueries = [
+        { REGISTRY_ID: cleanId },
+        { REGISTRY_ID: cleanId.toString() },
+      ];
+
+      console.log(`[DEBUG] Searching facilities collection for REGISTRY_ID: ${cleanId}`);
       console.log(`[DEBUG] Trying ${searchQueries.length} query variations`);
-      
-      let storedFacilityDetails = await FacilityDetails.findOne({ $or: searchQueries }).lean();
-      console.log(`[DEBUG] Found facility details: ${storedFacilityDetails ? 'Yes' : 'No'}`);
-      
-      if (!storedFacilityDetails) {
-        // Try a sample query to see what format REGISTRY_ID is stored in
-        const sample = await FacilityDetails.findOne({ REGISTRY_ID: { $exists: true } }).lean();
-        if (sample) {
-          console.log(`[DEBUG] Sample REGISTRY_ID type: ${typeof sample.REGISTRY_ID}, value: ${sample.REGISTRY_ID}`);
-          
-          // Try matching the exact type
-          if (typeof sample.REGISTRY_ID === 'number') {
-            const numId = parseInt(cleanId);
-            storedFacilityDetails = await FacilityDetails.findOne({ REGISTRY_ID: numId }).lean();
-            console.log(`[DEBUG] Tried as number (${numId}), found: ${storedFacilityDetails ? 'Yes' : 'No'}`);
-          } else if (typeof sample.REGISTRY_ID === 'string') {
-            storedFacilityDetails = await FacilityDetails.findOne({ REGISTRY_ID: cleanId }).lean();
-            console.log(`[DEBUG] Tried as string (${cleanId}), found: ${storedFacilityDetails ? 'Yes' : 'No'}`);
-          }
-        }
-        
-        if (!storedFacilityDetails) {
-          const totalCount = await FacilityDetails.countDocuments({});
-          console.log(`[DEBUG] Total documents in facilityDetails collection: ${totalCount}`);
-          
-          return res.status(404).json({
-            success: false,
-            error: `No facility details found with REGISTRY_ID: ${cleanId}`,
-            debug: {
-              searchedId: cleanId,
-              totalFacilityDetailsInDB: totalCount,
-              collectionName: FacilityDetails.collection.name,
-              databaseName: conn.db.databaseName,
-            },
-          });
-        }
-      }
 
-      // Extract facility data from storedFacilityDetails
-      // The facilityDetails document may have facility info in rawData or we need to extract from the stored data
-      const registryId = String(storedFacilityDetails.REGISTRY_ID || cleanId);
-      
-      // Extract raw facility data - try to get from rawData in stored details, or use storedFacilityDetails itself
-      // If facilityDetails has a rawData field with facility info, use that; otherwise use the document itself
-      const rawFacilityData = storedFacilityDetails.rawData || storedFacilityDetails;
-      
-      // Transform raw data using the transformRawData function
-      const transformedData = transformRawData(rawFacilityData);
-      
-      if (!transformedData) {
+      let facilityDoc = await Facility.findOne({ $or: searchQueries }).lean();
+
+      if (!facilityDoc) {
         return res.status(404).json({
           success: false,
-          error: `Could not transform facility data for REGISTRY_ID: ${cleanId}`,
+          error: `No facility found with REGISTRY_ID: ${cleanId}`,
         });
       }
-      
-      // Use transformed data as base
-      const facilityData = rawFacilityData;
 
-      // Use transformed data as the base structure
-      // Then enrich it with data from storedFacilityDetails (violations, inspections, etc.)
-      let facility = transformedData.facility;
-      let complianceScores = transformedData.complianceScores;
-      
-      // Extract and format violations, inspections, and enforcement actions from storedFacilityDetails
-      const violations = this.formatViolations(facilityData, storedFacilityDetails);
-      const inspections = this.formatInspections(facilityData, storedFacilityDetails);
-      const enforcementActions = this.formatEnforcementActions(facilityData, storedFacilityDetails);
-      
-      // Update compliance scores if we have more detailed data
-      if (violations.length > 0 || inspections.length > 0) {
-        // Recalculate scores based on actual violations/inspections
-        complianceScores = {
-          overall: this.calculateComplianceScore(facilityData, 'overall'),
-          air: this.calculateComplianceScore(facilityData, 'air'),
-          water: this.calculateComplianceScore(facilityData, 'water'),
-          waste: this.calculateComplianceScore(facilityData, 'waste'),
-        };
-      }
-      
-      // Merge permits from storedFacilityDetails if available
-      const enrichedPermits = this.formatPermits(facilityData, storedFacilityDetails);
-      if (enrichedPermits.length > 0) {
-        // Merge enriched permits with transformed permits (avoid duplicates)
-        const existingPermitNumbers = new Set(facility.permits.map(p => p.number));
-        enrichedPermits.forEach(permit => {
-          if (!existingPermitNumbers.has(permit.number)) {
-            facility.permits.push(permit);
-          } else {
-            // Update existing permit with enriched data
-            const existingIndex = facility.permits.findIndex(p => p.number === permit.number);
-            if (existingIndex >= 0) {
-              facility.permits[existingIndex] = { ...facility.permits[existingIndex], ...permit };
-            }
-          }
-        });
-      }
-      
-      // Update enforcement actions dates from storedFacilityDetails if available
-      const enrichedEnforcementDates = {
-        lastFormalActionEPA: this.extractEnforcementDate(storedFacilityDetails, 'formal', 'EPA') || facility.enforcementActions.lastFormalActionEPA,
-        lastFormalActionState: this.extractEnforcementDate(storedFacilityDetails, 'formal', 'State') || facility.enforcementActions.lastFormalActionState,
-        lastInformalActionEPA: this.extractEnforcementDate(storedFacilityDetails, 'informal', 'EPA') || facility.enforcementActions.lastInformalActionEPA,
-        lastInformalActionState: this.extractEnforcementDate(storedFacilityDetails, 'informal', 'State') || facility.enforcementActions.lastInformalActionState,
-      };
-      facility.enforcementActions = { ...facility.enforcementActions, ...enrichedEnforcementDates };
+      const registryId = String(facilityDoc.REGISTRY_ID || facilityDoc._id || cleanId);
 
-      // Parse compliance history
-      const complianceHistory = {
-        threeYear: this.parseComplianceHistory(
-          this.getValue(facilityData, ['FAC_3YR_COMPLIANCE_HISTORY', 'fac_3yr_compliance_history'])
-        ),
-        cwa13Quarters: this.parseComplianceHistory(
-          this.getValue(facilityData, ['CWA_13QTRS_COMPL_HISTORY', 'cwa_13qtrs_compl_history'])
-        ),
+      // Build facility object for response (keep same shape as before as much as possible)
+      const {
+        id: _removeId,
+        epaId: _removeEpaId,
+        facilityName: _removeFacilityName,
+        ...cleanFacility
+      } = facilityDoc;
+
+      const facility = {
+        ...cleanFacility,
       };
 
-      // Derive geolocation details
-      const lat = this.getValue(facilityData, ['FAC_LAT', 'Latitude', 'latitude']);
-      const lng = this.getValue(facilityData, ['FAC_LONG', 'Longitude', 'longitude']);
-      const geolocation = {
-        latitude: lat,
-        longitude: lng,
-        maps: this.generateMapUrl(lat, lng),
-        epaRegion: this.getValue(facilityData, ['FAC_EPA_REGION', 'fac_epa_region']),
-        epaRegionName: this.getEPARegionName(
-          this.getValue(facilityData, ['FAC_EPA_REGION', 'fac_epa_region'])
-        ),
-        county: this.getValue(facilityData, ['FAC_COUNTY', 'County', 'county']),
-        huc: this.getValue(facilityData, ['FAC_DERIVED_HUC', 'fac_derived_huc']),
-        watershed: this.getValue(facilityData, ['FAC_DERIVED_WBD', 'fac_derived_wbd']),
-      };
+      // Join related data from separate collections
+      const [violations, inspections, emissions, enforcementCases] = await Promise.all([
+        collections.violations.find({ facilityId: registryId }).toArray(),
+        collections.inspections.find({ facilityId: registryId }).toArray(),
+        collections.emissions.find({ facilityId: registryId }).toArray(),
+        collections.enforcements.find({ facilityId: registryId }).toArray(),
+      ]);
 
-      // Derive program flags
-      const programFlags = {
-        air: this.getValue(facilityData, ['AIR_FLAG', 'air_flag']) === 'Y',
-        npdes: this.getValue(facilityData, ['NPDES_FLAG', 'npdes_flag']) === 'Y',
-        sdwis: this.getValue(facilityData, ['SDWIS_FLAG', 'sdwis_flag']) === 'Y',
-        rcra: this.getValue(facilityData, ['RCRA_FLAG', 'rcra_flag']) === 'Y',
-        tri: this.getValue(facilityData, ['TRI_FLAG', 'tri_flag']) === 'Y',
-        ghg: this.getValue(facilityData, ['GHG_FLAG', 'ghg_flag']) === 'Y',
-      };
+      const complianceScores = facilityDoc.complianceScores || {};
 
-
-      // Add iconBaseURL to icon data if present
-      const iconBaseURL = storedFacilityDetails?.iconBaseURL || 'https://echo.epa.gov/themes/custom/echo/images/map/';
-      
-      // Add iconBaseURL to facility object
-      facility.iconBaseURL = iconBaseURL;
-      
-      // Process all icon fields and add full URLs
-      const iconFields = ['FAC_MAP_ICON', 'fac_map_icon', 'MapIcon', 'mapIcon', 'ICON', 'icon'];
-      iconFields.forEach(field => {
-        const iconValue = facilityData[field];
-        if (iconValue && typeof iconValue === 'string' && !iconValue.startsWith('http')) {
-          facilityData[`${field}_URL`] = `${iconBaseURL}${iconValue}`;
-          // Also add to facility object if it's the main icon
-          if (field === 'FAC_MAP_ICON' || field === 'fac_map_icon') {
-            facility.mapIcon = iconValue;
-            facility.mapIconURL = `${iconBaseURL}${iconValue}`;
-          }
-        }
-      });
-
-      // Get NPDES ID from facility data
-      const npdesId = this.getValue(facilityData, ['NPDES_IDS', 'npdes_ids', 'NPDES_ID', 'npdes_id']);
-
-      // Build enriched data object
-      const enrichedData = {
-        iconBaseURL: iconBaseURL,
-        programFlags,
-        complianceHistory,
-        geolocation,
-        npdesDetails: npdesId ? {
-          npdesId: npdesId,
-          permitTypes: this.getValue(facilityData, ['CWA_PERMIT_TYPES', 'cwa_permit_types']),
-        } : null,
-        dfrUrl: storedFacilityDetails?.dfrUrl || `https://echo.epa.gov/detailed-facility-report?fid=${registryId}`,
-      };
-
-      // Build comprehensive facility details from stored data
-      const comprehensiveDetails = storedFacilityDetails ? {
-        cwa: storedFacilityDetails.cwa || null,
-        caa: storedFacilityDetails.caa || null,
-        rcra: storedFacilityDetails.rcra || null,
-        sdwa: storedFacilityDetails.sdwa || null,
-        tri: storedFacilityDetails.tri || null,
-        ghg: storedFacilityDetails.ghg || null,
-        ejscreen: storedFacilityDetails.ejscreen || null,
-        fetchStatus: Object.fromEntries(storedFacilityDetails.fetchStatus || new Map()),
-        fetchErrors: Object.fromEntries(storedFacilityDetails.fetchErrors || new Map()),
-        lastFetched: storedFacilityDetails.lastFetched,
-      } : null;
-
-      // Build rawData object - use the facility data from facilityDetails
-      const rawData = this.formatRawData(facilityData);
-
-      // Return everything from DB as-is, just remove id, epaId, facilityName from facility object
-      // Get the document structure from storedFacilityDetails
-      const facilityObj = storedFacilityDetails.facility || {};
-      
-      // Remove id, epaId, facilityName from facility object (use different variable names to avoid conflict)
-      const { id: facilityId, epaId: facilityEpaId, facilityName: facilityNameField, ...cleanFacility } = facilityObj;
-      
-      // Build response with everything from DB, just cleaning the facility object
+      // Build response with joined data; keep field names the same
       const formattedResponse = {
-        facility: cleanFacility,
-        violations: storedFacilityDetails.violations || [],
-        inspections: storedFacilityDetails.inspections || [],
-        enforcementCases: storedFacilityDetails.enforcementCases || [],
-        complianceScores: storedFacilityDetails.complianceScores || {},
-        emissions: storedFacilityDetails.emissions || [],
+        facility,
+        violations,
+        inspections,
+        enforcementCases,
+        complianceScores,
+        emissions,
       };
 
       res.json(formattedResponse);
